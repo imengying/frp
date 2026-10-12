@@ -11,6 +11,7 @@ description = "frp 端到端集成测试"
 
 [dev-dependencies]
 anyhow.workspace = true
+rcgen.workspace = true
 toml.workspace = true
 tokio.workspace = true
 tracing.workspace = true

@@ -10,7 +10,10 @@ description = "frp 服务端与客户端共用的协议、配置与工具库"
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+rcgen.workspace = true
+rustls-pemfile.workspace = true
 socket2 = { version = "0.5", features = ["all"] }
+tokio-rustls.workspace = true
 toml.workspace = true
 tokio.workspace = true
 tracing.workspace = true

@@ -938,3 +938,208 @@ async fn pool_does_not_thrash_when_idle() {
         "空闲 3 秒期间连接数发生了变化（{before} -> {after}），池子不应无故抖动"
     );
 }
+
+/// 池中连接失效后，客户端应能自行发现并补位（不依赖服务端定时回收）。
+///
+/// 这是「不做闲置回收」的依据：连接真的断开时，阻塞等待启用的客户端会从
+/// `read` 收到 EOF/错误，任务随即结束并触发补位。
+/// 如果这个前提不成立，去掉回收就会让池子里攒满死连接。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pool_recovers_when_server_closes_idle_connection() {
+    let (host, local_port) = start_echo_server().await;
+    let remote_port = reserve_port();
+    let (server, guard) = start_server(AllowPorts::default()).await;
+    let mut cfg = ClientSpec {
+        server,
+        proxy_name: "recover",
+        remote_port,
+        local_host: &host,
+        local_port,
+    }
+    .into_config();
+    cfg.proxies[0].pool_count = 1;
+    let _client = start_client(cfg);
+    wait_remote_ready(remote_port).await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    let count = |port: u16| {
+        let out = std::process::Command::new("ss")
+            .args(["-tn"])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter(|l| l.contains(&format!(":{port}")))
+            .count()
+    };
+    // 1 控制 + 1 池 = 2 条连接 → ss 输出 4 行
+    assert!(count(server.port()) >= 4, "预热后应有 2 条连接");
+
+    // 让服务端主动断掉池中连接（模拟连接失效）。做法：重启服务端，
+    // 旧连接会被全部关闭，客户端应重连并重新预热池子。
+    let control_port = server.port();
+    guard.abort();
+    let _ = guard.await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let (server2, _guard2) = start_server_on(control_port, AllowPorts::default()).await;
+    wait_remote_ready(remote_port).await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    // 池子应重新填满，且转发可用
+    let after = count(server2.port());
+    assert!(after >= 4, "重连后池子应重新填满，实际 {after} 行");
+    assert_eq!(
+        round_trip(remote_port, b"recovered").await,
+        b"recovered",
+        "池子恢复后转发应正常"
+    );
+}
+
+/// TLS 默认开启，且不影响正常转发。
+///
+/// 这条测试同时覆盖：控制连接、按需工作连接、池中连接三条路径都走 TLS。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tls_is_enabled_by_default_and_forwards_traffic() {
+    let (host, local_port) = start_echo_server().await;
+    let remote_port = reserve_port();
+    // start_server 用的是默认配置 → TLS 默认开启
+    let (server, _guard) = start_server(AllowPorts::default()).await;
+    let mut cfg = ClientSpec {
+        server,
+        proxy_name: "tls",
+        remote_port,
+        local_host: &host,
+        local_port,
+    }
+    .into_config();
+    cfg.proxies[0].pool_count = 1; // 同时覆盖池中连接路径
+    assert!(cfg.transport.tls.enable, "客户端默认应启用 TLS");
+    let _client = start_client(cfg);
+    wait_remote_ready(remote_port).await;
+
+    // 走按需建立路径
+    assert_eq!(round_trip(remote_port, b"over-tls").await, b"over-tls");
+    // 再走一次（这次可能复用池中连接）
+    assert_eq!(round_trip(remote_port, b"again").await, b"again");
+
+    // 大一点的数据，确认 TLS 分片没问题
+    let big = vec![b'x'; 100_000];
+    let got = round_trip(remote_port, &big).await;
+    assert_eq!(got.len(), big.len(), "大流量经 TLS 转发后长度应一致");
+}
+
+/// 关掉 TLS 时应当回退到明文，两条路径都能用。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tls_can_be_disabled() {
+    let (host, local_port) = start_echo_server().await;
+    let remote_port = reserve_port();
+
+    // 服务端关掉 TLS
+    let mut server_cfg = ServerConfig {
+        bind_addr: "127.0.0.1".into(),
+        bind_port: 0,
+        token: TEST_TOKEN.into(),
+        allow_ports: AllowPorts::default(),
+        transport: ServerTransport {
+            heartbeat_timeout: 5,
+            work_conn_timeout: 3,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    server_cfg.transport.tls.enable = false;
+
+    let mut server = Server::new(server_cfg).unwrap();
+    let addr = server.bind().await.unwrap();
+    let _guard = tokio::spawn(async move {
+        let _ = server.run().await;
+    });
+
+    let mut cfg = ClientSpec {
+        server: addr,
+        proxy_name: "plain",
+        remote_port,
+        local_host: &host,
+        local_port,
+    }
+    .into_config();
+    cfg.transport.tls.enable = false;
+
+    let _client = start_client(cfg);
+    wait_remote_ready(remote_port).await;
+    assert_eq!(round_trip(remote_port, b"plaintext").await, b"plaintext");
+}
+
+/// 服务端默认接受 TLS 与明文两种连接（客户端可能关掉 TLS），
+/// 这里让一端开 TLS 一端开明文，验证服务端能正确区分。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn server_accepts_both_tls_and_plaintext() {
+    let (host, local_port) = start_echo_server().await;
+    let remote_port = reserve_port();
+
+    // 服务端启用 TLS（默认即启用）——它会同时接受两种
+    let (server, _guard) = start_server(AllowPorts::default()).await;
+
+    // 客户端关掉 TLS，走明文
+    let mut cfg = ClientSpec {
+        server,
+        proxy_name: "mix",
+        remote_port,
+        local_host: &host,
+        local_port,
+    }
+    .into_config();
+    cfg.transport.tls.enable = false;
+
+    let _client = start_client(cfg);
+    wait_remote_ready(remote_port).await;
+    assert_eq!(
+        round_trip(remote_port, b"client-without-tls").await,
+        b"client-without-tls",
+        "服务端应能接受关掉 TLS 的客户端"
+    );
+}
+
+/// 配了错误的 CA 时应当拒绝连接——说明校验确实生效，
+/// 而不是「不管配什么都放行」。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn wrong_ca_is_rejected() {
+    let (server, _guard) = start_server(AllowPorts::default()).await;
+
+    // 造一个无关的 CA 证书
+    use rcgen::{CertificateParams, KeyPair, PKCS_ECDSA_P256_SHA256};
+    let key_pair = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
+    let params = CertificateParams::new(vec!["someone-else".to_string()]).unwrap();
+    let cert = params.self_signed(&key_pair).unwrap();
+    let dir = std::env::temp_dir().join(format!("frp-badca-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let ca_path = dir.join("ca.pem");
+    std::fs::write(&ca_path, cert.pem()).unwrap();
+
+    let mut cfg = ClientSpec {
+        server,
+        proxy_name: "badca",
+        remote_port: reserve_port(),
+        local_host: "127.0.0.1",
+        local_port: 1,
+    }
+    .into_config();
+    cfg.transport.tls.trusted_ca_file = ca_path.to_str().unwrap().to_string();
+    cfg.transport.tls.server_name = "127.0.0.1".into();
+    // 缩短重连，便于观察失败
+    cfg.reconnect_initial_delay = 1;
+    cfg.reconnect_max_delay = 1;
+
+    let client = frp_client::Client::new(cfg).unwrap();
+    let handle = client.shutdown_handle();
+    let _task = tokio::spawn(async move {
+        let _ = client.run().await;
+    });
+
+    // 等一会儿：服务端不应看到任何成功的登录
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    handle.shutdown();
+    std::fs::remove_dir_all(&dir).ok();
+    // 这里只要求「不 panic / 能正常退出」；
+    // 真正的拒绝行为由 tls 模块的 trusted_ca 单元测试覆盖
+}

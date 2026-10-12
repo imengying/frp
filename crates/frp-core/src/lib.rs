@@ -7,6 +7,7 @@
 //! - [`net`][]: TCP 绑定/连接、keepalive 等调优
 //! - [`proxy_protocol`][]: 把访客真实地址透传给本地服务
 //! - [`signal`][]: 优雅退出的信号处理（SIGTERM / SIGINT）
+//! - [`tls`][]: TLS 加密（默认开启，服务端自动自签名）
 //! - [`task`][]: 后台任务的生命周期守卫
 //! - [`log`][]: 日志初始化
 //! - [`util`][]: 随机数、常量时间比较等小工具
@@ -19,4 +20,5 @@ pub mod protocol;
 pub mod proxy_protocol;
 pub mod signal;
 pub mod task;
+pub mod tls;
 pub mod util;

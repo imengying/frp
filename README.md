@@ -3,9 +3,10 @@
 一个用 Rust 写的极简 frp（内网穿透）实现，**只做 TCP**：不加密、不压缩，
 用全局 Token 认证，客户端自动重连。目标是代码短小、协议好懂、行为可预期。
 
-> ⚠️ **不加密**。控制连接与数据都是明文，Token 也以明文在线路上传输。
-> 仅适用于可信网络（内网、本机、已有隧道保护的场景）。需要公网暴露时，
-> 请自行套 WireGuard / SSH 隧道，或改用官方 frp 的 TLS 版本。
+> **默认启用 TLS 加密**（客户端与服务端之间的流量）。服务端未配置证书时会
+> 自动生成自签名证书，客户端默认不校验证书——也就是说默认**只保证加密，
+> 不保证对端身份**，能防被动嗅探，防不住中间人。需要真正的身份认证时，
+> 配置 `trustedCaFile` 指向自建 CA。
 
 ## 特性
 
@@ -27,6 +28,8 @@
   透传给本地服务，解决「后端只看到 frpc」的问题
 - **TCP keepalive**：及时发现被 NAT / 防火墙静默丢弃的半开连接
 - **半关闭透传**：`shutdown write` 逐跳传递，兼容 HTTP/1.1、SSH 等协议
+- **TLS 加密**（默认开启）：客户端与服务端之间全程加密，token 不再明文过网。
+  服务端自动生成自签名证书，开箱即用；配 `trustedCaFile` 可启用严格校验
 - **控制端口与代理端口分离**（`proxyBindAddr`）：控制端口留内网，代理端口暴露公网
 - **优雅退出**：收到 SIGTERM / SIGINT 时释放全部端口、断开客户端，
   重启服务不会遇到「端口被占用」
@@ -273,6 +276,10 @@ heartbeatTimeout = 90         # 超过该秒数没心跳就判离线并释放端
 workConnTimeout = 10          # 等客户端建立工作连接的超时
 tcpKeepalive = 60             # TCP keepalive 间隔，0 = 系统默认
 
+[transport.tls]               # 默认已开启，这里只在要用自己的证书时需要
+certFile = "/etc/frp/server.crt"
+keyFile = "/etc/frp/server.key"
+
 [log]
 level = "error"               # 默认就是 error（只记录错误），需要排查时调高
 ```
@@ -308,6 +315,9 @@ dialServerTimeout = 10        # 连接服务端超时
 dialLocalTimeout = 10         # 连接本地服务超时
 tcpKeepalive = 60
 
+[transport.tls]               # 默认已开启（加密但不校验身份）
+trustedCaFile = "/etc/frp/ca.crt"   # 需要严格校验时填，指向签发服务端证书的 CA
+
 [log]
 level = "error"               # 默认就是 error（只记录错误），需要排查时调高
 ```
@@ -324,6 +334,63 @@ level = "error"               # 默认就是 error（只记录错误），需要
 
 `reconnectInitialDelay` / `reconnectMaxDelay` 控制断线重连的退避区间
 （默认 1s / 30s），这是 frp 没有的扩展项。
+
+## TLS
+
+**默认开启**，客户端与服务端之间的流量（包括 token 登录信息与所有转发数据）全程加密。
+
+```
+访客 ──明文──> frps:remotePort ══TLS══> frpc ──明文──> 本地服务
+                              ↑
+                   公网这一段被加密
+```
+
+代理端口对访客保持明文（访客可能是浏览器、SSH 客户端，无法要求它们说 TLS）——
+这与官方 frp 的行为一致。
+
+### 开箱即用
+
+服务端未配置证书时，**每次启动自动生成一对自签名证书**（用后即弃，不落盘）；
+客户端默认不校验服务端证书。无需任何配置，也无需分发证书文件。
+
+代价是：默认只保证**加密**，不保证对端身份——能防被动嗅探，
+但理论上防不住中间人攻击。
+
+### 启用严格校验
+
+需要真正的身份认证时，用自建 CA 签发的证书：
+
+```bash
+# 1. 生成 CA 与服务端证书
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
+  -days 3650 -nodes -keyout ca.key -out ca.crt -subj "/CN=frp-ca"
+openssl req -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
+  -nodes -keyout server.key -out server.csr -subj "/CN=your-server-addr"
+openssl x509 -req -in server.csr -CA ca.crt -CAkey ca.key \
+  -CAcreateserial -out server.crt -days 3650
+```
+
+```toml
+# frps.toml
+[transport.tls]
+certFile = "/etc/frp/server.crt"
+keyFile = "/etc/frp/server.key"
+
+# frpc.toml
+[transport.tls]
+trustedCaFile = "/etc/frp/ca.crt"
+serverName = "your-server-addr"   # 留空则用 serverAddr
+```
+
+### 关闭 TLS
+
+```toml
+# 两端都要关
+[transport.tls]
+enable = false
+```
+
+服务端启用 TLS 时**同时接受明文连接**，所以可以逐个客户端迁移。
 
 ## 协议
 

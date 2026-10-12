@@ -28,9 +28,8 @@ use frp_core::net::connect_tcp;
 use frp_core::protocol::{Level, Message, PROTOCOL_VERSION};
 use frp_core::task::TaskGuard;
 use frp_core::util::random_fraction;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::{Notify, mpsc, oneshot};
 use tokio::time::{MissedTickBehavior, interval, sleep, timeout};
 use tracing::{debug, error, info, warn};
@@ -137,7 +136,13 @@ impl Client {
     /// 建立一次会话并维持长连接，返回会话结束的原因。
     async fn session(&self, backoff: &mut Backoff) -> SessionEnd {
         let server = self.server_addr();
-        let stream = match connect_tcp(&server, self.cfg.transport.tcp_keepalive).await {
+        let stream = match connect_server(
+            &server,
+            self.cfg.transport.tcp_keepalive,
+            &self.cfg.transport.tls,
+        )
+        .await
+        {
             Ok(stream) => stream,
             Err(err) => return SessionEnd::Disconnected(Some(err)),
         };
@@ -146,8 +151,8 @@ impl Client {
     }
 
     /// 在一条已建立的控制连接上完成登录并维持长连接。
-    async fn serve(&self, stream: TcpStream, backoff: &mut Backoff) -> SessionEnd {
-        let (mut rd, mut wr) = stream.into_split();
+    async fn serve(&self, stream: ServerStream, backoff: &mut Backoff) -> SessionEnd {
+        let (mut rd, mut wr) = tokio::io::split(stream);
         let interval_secs = self.cfg.transport.heartbeat_interval;
 
         // 一、登录
@@ -208,6 +213,7 @@ impl Client {
             run_id: run_id.clone(),
             server: self.server_addr(),
             max_pool_count,
+            tls: self.cfg.transport.tls.clone(),
         };
 
         // 用守卫托管后台任务：即使本函数被 abort，心跳与写任务也会随之停止。
@@ -246,7 +252,7 @@ impl Client {
     /// 控制连接的读循环。
     async fn read_loop(
         &self,
-        rd: &mut OwnedReadHalf,
+        rd: &mut tokio::io::ReadHalf<ServerStream>,
         ctx: &SessionCtx,
         alive: Arc<Notify>,
         mut dead_rx: oneshot::Receiver<anyhow::Error>,
@@ -264,9 +270,17 @@ impl Client {
                         let dial_timeout = Duration::from_secs(self.cfg.transport.dial_local_timeout);
                         let server = ctx.server.clone();
                         let run_id = ctx.run_id.clone();
+                        let tls = ctx.tls.clone();
                         tokio::spawn(async move {
-                            if let Err(err) =
-                                on_demand_work_conn(&server, &run_id, &nonce, &proxy, dial_timeout).await
+                            if let Err(err) = on_demand_work_conn(
+                                &server,
+                                &run_id,
+                                &nonce,
+                                &proxy,
+                                dial_timeout,
+                                &tls,
+                            )
+                            .await
                             {
                                 debug!("代理 `{}` 的工作连接结束: {err:#}", proxy.name);
                             }
@@ -330,6 +344,8 @@ struct SessionCtx {
     run_id: String,
     server: String,
     max_pool_count: usize,
+    /// TLS 配置（客户端连服务端的所有路径共用）
+    tls: frp_core::config::TlsConfig,
 }
 
 /// 连接池上限：服务端给了上限就取小值。
@@ -365,7 +381,10 @@ async fn pool_maintain_loop(cfg: Arc<ClientConfig>, ctx: SessionCtx) {
 
     let (finished_tx, mut finished_rx) = mpsc::channel::<String>(64);
     let mut inflight: HashMap<String, usize> = HashMap::new();
-    let mut handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+    // 用 JoinSet 而不是 Vec<JoinHandle>：join_next 会自动回收已完成的任务，
+    // 不必自己 retain；也不会像 Vec 那样在会话期间无界增长
+    // （池连接被服务端回收后每次补位都会新增一个句柄）。
+    let mut tasks: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
 
     for (proxy, count) in &want {
         debug!(
@@ -374,37 +393,40 @@ async fn pool_maintain_loop(cfg: Arc<ClientConfig>, ctx: SessionCtx) {
         );
         *inflight.entry(proxy.name.clone()).or_insert(0) += *count;
         for _ in 0..*count {
-            handles.push(tokio::spawn(pooled_work_conn(
+            tasks.spawn(pooled_work_conn(
                 ctx.clone(),
                 proxy.clone(),
                 finished_tx.clone(),
-            )));
+            ));
         }
     }
 
     // 每当有一条池中连接结束，就补一条，保持目标数量。
-    while let Some(name) = finished_rx.recv().await {
-        let current = inflight.entry(name.clone()).or_insert(0);
-        *current = current.saturating_sub(1);
-        let Some((proxy, count)) = want.iter().find(|(proxy, _)| proxy.name == name) else {
-            continue;
-        };
-        if *current >= *count {
-            continue;
+    loop {
+        tokio::select! {
+            // 有连接结束：先回收它的句柄，再按需补位
+            Some(_) = tasks.join_next() => {}
+            Some(name) = finished_rx.recv() => {
+                let current = inflight.entry(name.clone()).or_insert(0);
+                *current = current.saturating_sub(1);
+                let Some((proxy, count)) = want.iter().find(|(proxy, _)| proxy.name == name) else {
+                    continue;
+                };
+                if *current >= *count {
+                    continue;
+                }
+                *current += 1;
+                tasks.spawn(pooled_work_conn(
+                    ctx.clone(),
+                    proxy.clone(),
+                    finished_tx.clone(),
+                ));
+            }
+            else => break,
         }
-        *current += 1;
-        handles.push(tokio::spawn(pooled_work_conn(
-            ctx.clone(),
-            proxy.clone(),
-            finished_tx.clone(),
-        )));
-        // 回收已结束的任务句柄，避免无限增长
-        handles.retain(|handle| !handle.is_finished());
     }
 
-    for handle in handles {
-        handle.abort();
-    }
+    tasks.shutdown().await;
 }
 
 /// 会话结束的原因。
@@ -415,6 +437,90 @@ enum SessionEnd {
     Rejected(String),
 }
 
+/// 连接服务端并完成 TLS 握手（若启用）。
+///
+/// 客户端连服务端的所有路径（控制连接、按需工作连接、池中连接）都走这里，
+/// 保证 TLS 开关一致、不会漏掉某条路径。
+async fn connect_server(
+    server: &str,
+    keepalive: u64,
+    tls: &frp_core::config::TlsConfig,
+) -> Result<ServerStream> {
+    let stream = connect_tcp(server, keepalive)
+        .await
+        .with_context(|| format!("连接服务端 {server} 失败"))?;
+
+    if !tls.enable {
+        return Ok(ServerStream::Plain(stream));
+    }
+
+    // 校验用的名字：优先用配置的 serverName，否则用 serverAddr
+    let server_name = if tls.server_name.is_empty() {
+        server.split(':').next().unwrap_or(server).to_string()
+    } else {
+        tls.server_name.clone()
+    };
+    let stream = frp_core::tls::connect_with_marker(stream, &tls.trusted_ca_file, &server_name)
+        .await
+        .with_context(|| format!("与 {server} 的 TLS 握手失败"))?;
+    Ok(ServerStream::Tls(Box::new(stream)))
+}
+
+/// 客户端到服务端的连接：明文或 TLS。
+///
+/// 用枚举而不是 `Box<dyn>`：这里的两种类型都是已知的，
+/// 枚举不会引入额外的间接层，转发热路径上更划算。
+pub enum ServerStream {
+    Plain(TcpStream),
+    Tls(Box<tokio_rustls::client::TlsStream<TcpStream>>),
+}
+
+impl AsyncRead for ServerStream {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match &mut *self {
+            ServerStream::Plain(s) => std::pin::Pin::new(s).poll_read(cx, buf),
+            ServerStream::Tls(s) => std::pin::Pin::new(s).poll_read(cx, buf),
+        }
+    }
+}
+
+impl AsyncWrite for ServerStream {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        match &mut *self {
+            ServerStream::Plain(s) => std::pin::Pin::new(s).poll_write(cx, buf),
+            ServerStream::Tls(s) => std::pin::Pin::new(s).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match &mut *self {
+            ServerStream::Plain(s) => std::pin::Pin::new(s).poll_flush(cx),
+            ServerStream::Tls(s) => std::pin::Pin::new(s).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match &mut *self {
+            ServerStream::Plain(s) => std::pin::Pin::new(s).poll_shutdown(cx),
+            ServerStream::Tls(s) => std::pin::Pin::new(s).poll_shutdown(cx),
+        }
+    }
+}
+
 /// 按需求建立一条工作连接（服务端下发 `ReqWorkConn` 时）。
 async fn on_demand_work_conn(
     server: &str,
@@ -422,10 +528,9 @@ async fn on_demand_work_conn(
     nonce: &str,
     proxy: &ProxyConfig,
     dial_timeout: Duration,
+    tls: &frp_core::config::TlsConfig,
 ) -> Result<()> {
-    let mut stream = connect_tcp(server, 0)
-        .await
-        .with_context(|| format!("连接服务端 {server} 建立工作连接失败"))?;
+    let mut stream = connect_server(server, 0, tls).await?;
     let hello = Message::NewWorkConn {
         run_id: run_id.to_string(),
         nonce: Some(nonce.to_string()),
@@ -452,9 +557,7 @@ async fn pooled_work_conn(ctx: SessionCtx, proxy: ProxyConfig, finished_tx: mpsc
     let mut reported = false;
 
     let result = async {
-        let mut stream = connect_tcp(&ctx.server, 0)
-            .await
-            .with_context(|| format!("连接服务端 {} 建立空闲工作连接失败", ctx.server))?;
+        let mut stream = connect_server(&ctx.server, 0, &ctx.tls).await?;
         let hello = Message::NewWorkConn {
             run_id: ctx.run_id.clone(),
             nonce: None,
@@ -464,10 +567,14 @@ async fn pooled_work_conn(ctx: SessionCtx, proxy: ProxyConfig, finished_tx: mpsc
             .await
             .context("发送空闲工作连接握手失败")?;
 
-        // 等被服务端启用；期间这条连接就停在池子里
-        let start = timeout(POOL_WAIT_TIMEOUT, read_msg(&mut stream))
-            .await
-            .map_err(|_| anyhow!("空闲工作连接等待被启用超时"))??;
+        // 一直等被服务端启用；这条连接就停在服务端的池子里。
+        //
+        // 这里不设等待超时（对齐官方 frp）：池连接可能闲置很久才被用上
+        // （代理长期没访问），设超时会让它被定期关闭又重建。
+        // 连接真的失效时（客户端被网络断开、服务端关闭连接等），
+        // 这里的 read 会返回 EOF 或错误，任务结束并触发补位；
+        // 静默失效的场景由 TCP keepalive 兜底。
+        let start = read_msg(&mut stream).await?;
         let Some(Message::StartWorkConn { proxy_name }) = start else {
             anyhow::bail!("空闲工作连接收到的消息非法: {:?}", start.map(|m| m.kind()));
         };
@@ -497,17 +604,11 @@ async fn pooled_work_conn(ctx: SessionCtx, proxy: ProxyConfig, finished_tx: mpsc
     }
 }
 
-/// 池中连接等待被服务端启用的最长时间。
-///
-/// 与服务端的回收超时保持一致，略长一点，避免两边同时放弃时产生歧义。
-const POOL_WAIT_TIMEOUT: Duration = Duration::from_secs(75);
-
 /// 连接本地服务并双向转发，直到本次访问结束。
-async fn forward_to_local(
-    stream: TcpStream,
-    proxy: &ProxyConfig,
-    dial_timeout: Duration,
-) -> Result<()> {
+async fn forward_to_local<S>(stream: S, proxy: &ProxyConfig, dial_timeout: Duration) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
     let local_addr = proxy.local_target();
     let local = timeout(dial_timeout, connect_tcp(&local_addr, 0))
         .await
@@ -671,7 +772,7 @@ async fn check_local_tcp(proxy: &ProxyConfig) -> bool {
 }
 
 /// 控制连接的写任务。
-async fn writer_loop(mut wr: OwnedWriteHalf, mut rx: mpsc::Receiver<Message>) {
+async fn writer_loop(mut wr: tokio::io::WriteHalf<ServerStream>, mut rx: mpsc::Receiver<Message>) {
     while let Some(msg) = rx.recv().await {
         if let Err(err) = write_msg(&mut wr, &msg).await {
             debug!("控制连接写失败: {err:#}");

@@ -413,6 +413,62 @@ fn is_valid_name(name: &str) -> bool {
 
 // ---------------------------------------------------------------- 服务端
 
+// ---------------------------------------------------------------- TLS
+
+/// TLS 配置，对应 frp 的 `[transport.tls]`。
+///
+/// **默认开启**，与官方 frp 一致（v0.50.0 起默认加密）。
+///
+/// 服务端不配置证书时会**每次启动自动生成一对自签名证书**（用后即弃）；
+/// 客户端默认不校验服务端证书。也就是说默认只保证**加密**，不保证对端身份——
+/// 能防被动嗅探，防不住中间人。
+///
+/// 需要真正的身份认证：服务端配 `certFile`/`keyFile`，
+/// 客户端配 `trustedCaFile` 指向签发该证书的 CA，此时会严格校验证书。
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields, rename_all = "camelCase")]
+pub struct TlsConfig {
+    /// 是否启用 TLS。默认 `true`。
+    pub enable: bool,
+    /// 服务端证书文件（PEM）。留空则自动生成自签名证书。仅服务端使用。
+    pub cert_file: String,
+    /// 服务端私钥文件（PEM）。仅服务端使用。
+    pub key_file: String,
+    /// 信任的 CA 证书文件（PEM）。仅客户端使用。
+    ///
+    /// 留空 = 不校验服务端证书（默认）。
+    pub trusted_ca_file: String,
+    /// TLS 校验时使用的服务端名称，默认用 `serverAddr`。仅客户端使用。
+    pub server_name: String,
+}
+
+impl Default for TlsConfig {
+    fn default() -> Self {
+        Self {
+            // 默认开启加密：内网穿透的流量会经过公网，明文传输 token 与数据
+            // 风险太大。默认开启是官方 frp 从 v0.50.0 起的做法。
+            enable: true,
+            cert_file: String::new(),
+            key_file: String::new(),
+            trusted_ca_file: String::new(),
+            server_name: String::new(),
+        }
+    }
+}
+
+impl TlsConfig {
+    /// 校验配置的合法性（不含文件是否存在，那在加载时才检查）。
+    pub fn validate(&self) -> Result<()> {
+        if !self.cert_file.is_empty() && self.key_file.is_empty() {
+            bail!("transport.tls.certFile 与 keyFile 必须同时配置");
+        }
+        if self.cert_file.is_empty() && !self.key_file.is_empty() {
+            bail!("transport.tls.certFile 与 keyFile 必须同时配置");
+        }
+        Ok(())
+    }
+}
+
 /// 服务端 `[transport]`，对应 frp 的同名段。
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields, rename_all = "camelCase")]
@@ -425,6 +481,8 @@ pub struct ServerTransport {
     ///
     /// 用于及时发现半开连接（NAT / 防火墙悄悄丢弃连接的情况）。
     pub tcp_keepalive: u64,
+    /// TLS 配置。默认开启。
+    pub tls: TlsConfig,
 }
 
 impl Default for ServerTransport {
@@ -433,6 +491,7 @@ impl Default for ServerTransport {
             heartbeat_timeout: 90,
             work_conn_timeout: 10,
             tcp_keepalive: 60,
+            tls: TlsConfig::default(),
         }
     }
 }
@@ -525,6 +584,7 @@ impl ServerConfig {
         if self.transport.work_conn_timeout == 0 {
             bail!("transport.workConnTimeout 必须大于 0");
         }
+        self.transport.tls.validate()?;
         Ok(())
     }
 }
@@ -543,6 +603,8 @@ pub struct ClientTransport {
     pub dial_local_timeout: u64,
     /// 所有 TCP 连接上的保活探测间隔（秒）；`0` 表示使用系统默认。
     pub tcp_keepalive: u64,
+    /// TLS 配置。默认开启。
+    pub tls: TlsConfig,
 }
 
 impl Default for ClientTransport {
@@ -552,6 +614,7 @@ impl Default for ClientTransport {
             dial_server_timeout: 10,
             dial_local_timeout: 10,
             tcp_keepalive: 60,
+            tls: TlsConfig::default(),
         }
     }
 }
@@ -634,6 +697,7 @@ impl ClientConfig {
         if self.reconnect_max_delay < self.reconnect_initial_delay {
             bail!("reconnectMaxDelay 不能小于 reconnectInitialDelay");
         }
+        self.transport.tls.validate()?;
         if self.proxies.is_empty() {
             bail!("至少需要配置一个 [[proxies]]");
         }

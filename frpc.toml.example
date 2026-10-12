@@ -13,6 +13,12 @@ localIP = "127.0.0.1"
 localPort = 22
 remotePort = 6000
 
+# TLS 默认开启。默认不校验服务端证书（只加密、不认证身份），
+# 需要严格校验时指向签发服务端证书的 CA。
+#
+# [transport.tls]
+# trustedCaFile = "/etc/frp/ca.crt"
+
 # 其它可选配置（取消注释即可启用）：
 #
 # 连接池：预先建立空闲连接，访问时直接复用（默认 0 = 不用）

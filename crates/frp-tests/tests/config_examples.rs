@@ -90,6 +90,8 @@ fn frps_example_commented_keys_exist() {
         "heartbeatTimeout",
         "workConnTimeout",
         "tcpKeepalive",
+        "certFile",
+        "keyFile",
         "level",
     ]
     .into_iter()
@@ -122,6 +124,8 @@ fn frpc_example_commented_keys_exist() {
         "dialServerTimeout",
         "dialLocalTimeout",
         "tcpKeepalive",
+        "trustedCaFile",
+        "serverName",
         "level",
     ]
     .into_iter()

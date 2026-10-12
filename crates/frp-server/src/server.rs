@@ -12,11 +12,9 @@
 //!    连接」的老路。
 //!
 //! 省掉一次「控制连接往返 + 新建 TCP」，SSH 这类交互式场景的首字节延迟会明显降低。
-//! 池中连接闲置超过 [`POOL_IDLE_TIMEOUT`] 会被主动关闭，避免双方都没察觉的失效连接。
 
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -28,8 +26,7 @@ use frp_core::protocol::{Level, Message, PROTOCOL_VERSION, ProxyError};
 use frp_core::proxy_protocol::ProxyProtocol;
 use frp_core::task::TaskGuard;
 use frp_core::util::{constant_time_eq, random_hex};
-use tokio::io::AsyncWriteExt;
-use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::{JoinHandle, JoinSet};
@@ -45,11 +42,20 @@ const CONTROL_QUEUE: usize = 128;
 /// 心跳应答要送达（否则客户端会误判连接失效），队列满时等一会儿；
 /// 但客户端若彻底卡死，读循环不能被无限拖住，所以设这个上限。
 const HEARTBEAT_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
-/// 池中空闲工作连接的最长闲置时间，超过则由服务端主动关闭。
-const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+/// 服务端接受的连接：可能是明文，也可能是 TLS。
+///
+/// 客户端连到 `bindPort` 时可能带 TLS（默认带），也可能是明文（客户端关掉了 TLS）。
+/// 两种都要能处理，所以用 trait 对象统一——这里不需要区分具体类型，
+/// 后续的读写都走 `AsyncRead`/`AsyncWrite`。
+///
+/// 用 `Box<dyn ...>` 而不是泛型参数：控制连接、工作连接、池中连接都要存这个类型，
+/// 泛型会传染到几乎所有数据结构与函数签名，而这里的虚拟调用开销相对网络 I/O
+/// 可以忽略。
+pub type Conn = Box<dyn ConnStream>;
 
-/// 池中连接的自增编号。
-static POOL_SEQ: AtomicU64 = AtomicU64::new(1);
+/// 明文与 TLS 连接共同满足的约束。
+pub trait ConnStream: AsyncRead + AsyncWrite + Unpin + Send {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> ConnStream for T {}
 
 /// 关闭句柄：用于优雅停止服务端。
 #[derive(Clone)]
@@ -91,10 +97,32 @@ impl Server {
     pub fn new(cfg: ServerConfig) -> Result<Self> {
         cfg.validate()?;
         let cfg = Arc::new(cfg);
+
+        // 启用 TLS 时构建服务端配置：未配证书就现场生成一对自签名证书
+        // （用后即弃，客户端默认不校验，所以不需要落盘）
+        let tls = if cfg.transport.tls.enable {
+            let tls = frp_core::tls::ServerTls::new(
+                &cfg.transport.tls.cert_file,
+                &cfg.transport.tls.key_file,
+            )?;
+            if cfg.transport.tls.cert_file.is_empty() {
+                info!("TLS 已启用，使用自动生成的自签名证书");
+            } else {
+                info!(
+                    "TLS 已启用，使用证书 {} / {}",
+                    cfg.transport.tls.cert_file, cfg.transport.tls.key_file
+                );
+            }
+            Some(tls)
+        } else {
+            None
+        };
+
         let shared = Arc::new(Shared {
             cfg: cfg.clone(),
             proxies: Mutex::new(HashMap::new()),
             pending: Mutex::new(HashMap::new()),
+            tls,
         });
         let (shutdown_tx, _) = watch::channel(false);
         Ok(Self {
@@ -154,8 +182,17 @@ impl Server {
                         tune_stream(&stream, shared.cfg.transport.tcp_keepalive);
                         let shared = shared.clone();
                         conns.spawn(async move {
-                            if let Err(err) = handle_conn(shared, stream, peer).await {
-                                debug!("连接 {peer} 处理结束: {err:#}");
+                            // 先判断这条连接是不是 TLS（读一个字节），
+                            // 再决定用哪种方式处理
+                            match shared.accept_tls(stream).await {
+                                Ok(stream) => {
+                                    if let Err(err) = handle_conn(shared, stream, peer).await {
+                                        debug!("连接 {peer} 处理结束: {err:#}");
+                                    }
+                                }
+                                Err(err) => {
+                                    debug!("连接 {peer} TLS 握手失败: {err:#}");
+                                }
                             }
                         });
                     }
@@ -179,16 +216,14 @@ impl Server {
 struct PendingWork {
     run_id: String,
     proxy_name: String,
-    sender: oneshot::Sender<TcpStream>,
+    sender: oneshot::Sender<Conn>,
 }
 
 /// 池中的一条空闲工作连接。
 struct PooledWork {
-    /// 用于回收任务定位自己。
-    id: u64,
     /// 整条连接：池中连接需要「先写 StartWorkConn 再双向转发」，
     /// 保持成一个整体最省事，不必拆分再拼回。
-    stream: TcpStream,
+    stream: Conn,
 }
 
 /// 已注册的代理。
@@ -213,9 +248,40 @@ struct Shared {
     proxies: Mutex<HashMap<String, ProxyEntry>>,
     /// nonce -> 等待中的工作连接。
     pending: Mutex<HashMap<String, PendingWork>>,
+    /// TLS 材料；未启用 TLS 时为 `None`。
+    tls: Option<frp_core::tls::ServerTls>,
 }
 
 impl Shared {
+    /// 判断并处理一条新连接：TLS 连接完成握手，明文连接原样返回。
+    ///
+    /// 做法是读第一个字节（对齐官方 frp 的约定）：
+    /// - `0x17`（我们的标记）或 `0x16`（标准 TLS ClientHello）→ 走 TLS
+    /// - 其他 → 明文连接，把读掉的那个字节续回流的开头
+    async fn accept_tls(&self, stream: TcpStream) -> Result<Conn> {
+        let Some(tls) = self.tls.as_ref() else {
+            // 未启用 TLS：不做任何探测，避免白白多读一个字节
+            return Ok(Box::new(stream));
+        };
+
+        use tokio::io::AsyncReadExt;
+        let mut stream = stream;
+        let mut first = [0u8; 1];
+        // 读不到（对端秒断）就直接结束，交给上层记录
+        let n = stream
+            .read(&mut first)
+            .await
+            .context("读取连接首字节失败")?;
+        if n == 0 {
+            bail!("连接在发送任何数据前就关闭了");
+        }
+
+        match tls.accept_if_tls(stream, first[0]).await? {
+            frp_core::tls::AcceptedStream::Tls(tls_stream) => Ok(tls_stream),
+            frp_core::tls::AcceptedStream::Plain(plain) => Ok(Box::new(plain)),
+        }
+    }
+
     /// 查询某代理当前会话，用于下发 `ReqWorkConn`。
     fn control_for(&self, name: &str) -> Option<(String, mpsc::Sender<Message>)> {
         let map = self.proxies.lock().unwrap();
@@ -250,27 +316,12 @@ impl Shared {
         true
     }
 
-    /// 按 id 移除池中连接（回收任务用）。
-    fn remove_pooled(&self, name: &str, id: u64) -> bool {
-        let mut map = self.proxies.lock().unwrap();
-        let Some(entry) = map.get_mut(name) else {
-            return false;
-        };
-        match entry.pool.iter().position(|work| work.id == id) {
-            Some(pos) => {
-                entry.pool.remove(pos);
-                true
-            }
-            None => false,
-        }
-    }
-
     fn insert_pending(
         &self,
         nonce: String,
         run_id: String,
         proxy_name: String,
-        sender: oneshot::Sender<TcpStream>,
+        sender: oneshot::Sender<Conn>,
     ) {
         self.pending.lock().unwrap().insert(
             nonce,
@@ -302,7 +353,10 @@ impl Shared {
 
     /// 注销某个会话持有的所有代理，并释放其远端端口。
     fn unregister_run(&self, run_id: &str) {
-        let removed: Vec<(String, JoinHandle<()>)> = {
+        // 整条 ProxyEntry 都取出来（含池中连接），在锁外关闭。
+        // 不要只取 acceptor 而把其余部分留在锁里 drop：关闭 socket 是系统调用，
+        // 持锁做 I/O 会拖住所有其他访问代理的操作。
+        let removed: Vec<(String, ProxyEntry)> = {
             let mut map = self.proxies.lock().unwrap();
             let names: Vec<String> = map
                 .iter()
@@ -311,12 +365,21 @@ impl Shared {
                 .collect();
             names
                 .into_iter()
-                .filter_map(|name| map.remove(&name).map(|entry| (name, entry.acceptor)))
+                .filter_map(|name| map.remove(&name).map(|entry| (name, entry)))
                 .collect()
         };
-        for (name, acceptor) in removed {
-            // abort 监听任务即释放远端端口；池中连接随 ProxyEntry 一起 drop 关闭。
-            acceptor.abort();
+        for (name, entry) in removed {
+            // abort 监听任务即释放远端端口
+            entry.acceptor.abort();
+            // 池中连接在这里显式关闭：与官方 frp 的做法一致，
+            // 不依赖 drop 顺序（池里可能攒着多条连接）
+            let pooled = entry.pool.len();
+            for work in entry.pool {
+                drop(work.stream);
+            }
+            if pooled > 0 {
+                debug!("代理 `{name}` 关闭了 {pooled} 条池中连接");
+            }
             info!("代理 `{name}` 已注销（会话 {run_id} 结束）");
         }
         self.pending
@@ -349,6 +412,7 @@ impl Shared {
 
     /// 关闭服务端时释放全部代理。
     fn shutdown_all(&self) {
+        // 与 unregister_run 同理：先把条目取出来，再在锁外释放资源
         let entries: Vec<ProxyEntry> = {
             let mut map = self.proxies.lock().unwrap();
             map.drain().map(|(_, entry)| entry).collect()
@@ -356,6 +420,9 @@ impl Shared {
         let count = entries.len();
         for entry in entries {
             entry.acceptor.abort();
+            for work in entry.pool {
+                drop(work.stream);
+            }
         }
         if count > 0 {
             debug!("已释放 {count} 个代理端口");
@@ -514,7 +581,7 @@ impl Shared {
 }
 
 /// 处理一条新连接：依据首条消息判定是控制连接还是工作连接。
-async fn handle_conn(shared: Arc<Shared>, mut stream: TcpStream, peer: SocketAddr) -> Result<()> {
+async fn handle_conn(shared: Arc<Shared>, mut stream: Conn, peer: SocketAddr) -> Result<()> {
     let first = timeout(FIRST_MSG_TIMEOUT, read_msg(&mut stream))
         .await
         .context("等待首条消息超时")??;
@@ -541,13 +608,13 @@ async fn handle_conn(shared: Arc<Shared>, mut stream: TcpStream, peer: SocketAdd
 /// 处理控制连接。
 async fn handle_control(
     shared: Arc<Shared>,
-    stream: TcpStream,
+    stream: Conn,
     peer: SocketAddr,
     version: u32,
     token: String,
     proxies: Vec<ProxyConfig>,
 ) -> Result<()> {
-    let (mut rd, mut wr) = stream.into_split();
+    let (mut rd, mut wr) = tokio::io::split(stream);
 
     if version != PROTOCOL_VERSION {
         let reason = format!("协议版本不匹配: 服务端 {PROTOCOL_VERSION}, 客户端 {version}");
@@ -598,7 +665,7 @@ async fn handle_control(
 /// 控制连接的读循环：处理心跳、动态注册/注销代理，并维持长连接。
 async fn control_read_loop(
     shared: &Arc<Shared>,
-    rd: &mut OwnedReadHalf,
+    rd: &mut tokio::io::ReadHalf<Conn>,
     out_tx: &mpsc::Sender<Message>,
     run_id: &str,
     peer: SocketAddr,
@@ -666,7 +733,7 @@ async fn control_read_loop(
 /// - 不带 `nonce`：放进连接池，等公网访问来了再通过 `StartWorkConn` 启用。
 async fn handle_work_conn(
     shared: Arc<Shared>,
-    stream: TcpStream,
+    stream: Conn,
     peer: SocketAddr,
     run_id: String,
     nonce: Option<String>,
@@ -694,10 +761,15 @@ async fn handle_work_conn(
     Ok(())
 }
 
-/// 把一条空闲工作连接放进池子，并安排闲置回收。
+/// 把一条空闲工作连接放进池子。
+///
+/// 这里**不做闲置回收**（对齐官方 frp）：池中连接一旦失效，
+/// 阻塞等待它的客户端会从 `read` 收到 EOF/错误并立刻补一条新的；
+/// 而长时间静默失效的连接由 TCP keepalive 兜底发现。
+/// 主动定时回收反而会与客户端的补充逻辑形成周期性重建。
 fn pool_work_conn(
     shared: Arc<Shared>,
-    stream: TcpStream,
+    stream: Conn,
     peer: SocketAddr,
     run_id: String,
     proxy_name: String,
@@ -714,25 +786,11 @@ fn pool_work_conn(
         }
     }
 
-    let id = POOL_SEQ.fetch_add(1, Ordering::Relaxed);
-    if !shared.push_pooled(&proxy_name, PooledWork { id, stream }) {
+    if !shared.push_pooled(&proxy_name, PooledWork { stream }) {
         debug!("代理 `{proxy_name}` 的连接池已满，关闭来自 {peer} 的多余空闲连接");
         return;
     }
     debug!("代理 `{proxy_name}` 的连接池 +1（来自 {peer}）");
-
-    // 闲置太久没被用上就主动关闭，避免池里堆着已失效的连接。
-    let reaper_shared = shared.clone();
-    let reaper_name = proxy_name.clone();
-    tokio::spawn(async move {
-        tokio::time::sleep(POOL_IDLE_TIMEOUT).await;
-        if reaper_shared.remove_pooled(&reaper_name, id) {
-            debug!(
-                "代理 `{reaper_name}` 的池中连接闲置超过 {}s，已关闭",
-                POOL_IDLE_TIMEOUT.as_secs()
-            );
-        }
-    });
 }
 
 /// 某个代理端口的监听任务；被 abort 时端口自动释放。
@@ -799,6 +857,8 @@ async fn handle_visitor(
     let nonce = random_hex(16);
     let (work_tx, work_rx) = oneshot::channel();
     shared.insert_pending(nonce.clone(), run_id, proxy_name.clone(), work_tx);
+    // 从这一刻起，无论走哪条路径离开本函数，pending 条目都会被清理
+    let mut pending = PendingGuard::new(shared.clone(), nonce.clone());
 
     let req = Message::ReqWorkConn {
         nonce: nonce.clone(),
@@ -806,13 +866,15 @@ async fn handle_visitor(
     };
     if control_tx.send(req).await.is_err() {
         info!("代理 `{proxy_name}` 的客户端会话已结束，拒绝来自 {peer} 的访问");
-        shared.remove_pending(&nonce);
-        return;
+        return; // PendingGuard 负责清理
     }
 
     let wait = Duration::from_secs(shared.cfg.transport.work_conn_timeout);
     match timeout(wait, work_rx).await {
         Ok(Ok(mut work)) => {
+            // 配对成功：条目已被 handle_work_conn 取走，这里不再重复删除
+            pending.matched();
+
             // 在正式数据前附上访客真实地址（未启用时不写任何东西）
             if let Err(err) = frp_core::proxy_protocol::write_header(
                 &mut work,
@@ -829,12 +891,47 @@ async fn handle_visitor(
             debug!("代理 `{proxy_name}` 的访问 {peer} 结束: 上行 {up} 字节, 下行 {down} 字节");
         }
         Ok(Err(_)) => {
-            shared.remove_pending(&nonce);
             info!("代理 `{proxy_name}` 的客户端会话已结束，关闭访问 {peer}");
         }
         Err(_) => {
-            shared.remove_pending(&nonce);
             warn!("等待客户端为代理 `{proxy_name}` 建立工作连接超时（访问来源 {peer}）");
+        }
+    }
+}
+
+/// 待配对工作连接的 RAII 清理守卫。
+///
+/// `pending` 里的条目必须在本次访问结束时移除，否则会一直留在表里。
+/// 原先靠每条 `return` 路径手动调用 `remove_pending`——这种写法很脆，
+/// 以后往 `handle_visitor` 里加分支时很容易漏掉一处。
+/// 交给 Drop 之后，无论从哪条路径离开都会清理。
+struct PendingGuard {
+    shared: Arc<Shared>,
+    nonce: String,
+    /// 配对成功后置为 true：此时条目已被 `take_pending` 取走，
+    /// 不需要（也不应该）再删一次。
+    matched: bool,
+}
+
+impl PendingGuard {
+    fn new(shared: Arc<Shared>, nonce: String) -> Self {
+        Self {
+            shared,
+            nonce,
+            matched: false,
+        }
+    }
+
+    /// 标记为已配对（条目已被取走）。
+    fn matched(&mut self) {
+        self.matched = true;
+    }
+}
+
+impl Drop for PendingGuard {
+    fn drop(&mut self) {
+        if !self.matched {
+            self.shared.remove_pending(&self.nonce);
         }
     }
 }
@@ -849,7 +946,7 @@ async fn activate_pooled(
     version: ProxyProtocol,
     src: SocketAddr,
     dst: SocketAddr,
-) -> Result<TcpStream, PooledWork> {
+) -> Result<Conn, PooledWork> {
     let start = Message::StartWorkConn {
         proxy_name: proxy_name.to_string(),
     };
@@ -870,7 +967,7 @@ async fn activate_pooled(
 }
 
 /// 控制连接的写任务。
-async fn writer_loop(mut wr: OwnedWriteHalf, mut rx: mpsc::Receiver<Message>) {
+async fn writer_loop(mut wr: tokio::io::WriteHalf<Conn>, mut rx: mpsc::Receiver<Message>) {
     while let Some(msg) = rx.recv().await {
         if let Err(err) = write_msg(&mut wr, &msg).await {
             debug!("控制连接写失败: {err:#}");
@@ -882,7 +979,7 @@ async fn writer_loop(mut wr: OwnedWriteHalf, mut rx: mpsc::Receiver<Message>) {
 
 /// 发送登录响应。
 async fn send_login_resp(
-    wr: &mut OwnedWriteHalf,
+    wr: &mut tokio::io::WriteHalf<Conn>,
     ok: bool,
     run_id: &str,
     error: Option<String>,
