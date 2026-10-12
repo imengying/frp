@@ -45,9 +45,8 @@
 ### 发布
 
 - 服务端与客户端分别打包：`frps_<版本>_<平台>.tar.gz` 与 `frpc_<版本>_<平台>.tar.gz`
-- 平台：Linux x86_64 / aarch64 / armv7（glibc 与 musl 静态）、
-  macOS（Intel / Apple Silicon）、Windows
-- 静态 musl 包可在任意发行版与 Alpine 上直接运行
+- 平台：Linux x86_64 / aarch64 / armv7，glibc 与 musl 静态两种
+- 静态 musl 包不依赖系统 libc，可在任意发行版与 Alpine 上直接运行
 
 ### 已知限制
 
