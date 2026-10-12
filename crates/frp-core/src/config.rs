@@ -37,23 +37,50 @@ impl Default for LogConfig {
 
 /// 允许客户端申请的远端端口，对应 frp 的 `allowPorts`。
 ///
-/// 写法与 frp 一致：
+/// 两种写法都支持：
 ///
 /// ```toml
+/// # frp 的数组写法
 /// allowPorts = [
 ///     { start = 6000, end = 6010 },
 ///     { single = 7000 },
 /// ]
+///
+/// # 等价简写
+/// allowPorts = "6000-6010,7000"
 /// ```
 ///
-/// 不配置（或空列表）表示不限制。
+/// 不配置（或留空）表示不限制。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AllowPorts {
     ranges: Vec<(u16, u16)>,
 }
 
 impl AllowPorts {
-    /// 用单个端口构造（供代码内使用，配置里请用 frp 的数组写法）。
+    /// 解析简写字符串（逗号分隔，支持 `单个端口` 与 `起-止`）。
+    pub fn parse(spec: &str) -> Result<Self> {
+        let mut ranges = Vec::new();
+        for item in spec.split(',') {
+            let item = item.trim();
+            if item.is_empty() {
+                continue;
+            }
+            let (start, end) = match item.split_once('-') {
+                Some((a, b)) => (parse_port(a.trim())?, parse_port(b.trim())?),
+                None => {
+                    let port = parse_port(item)?;
+                    (port, port)
+                }
+            };
+            if start > end {
+                bail!("端口范围 `{item}` 的起始端口大于结束端口");
+            }
+            ranges.push((start, end));
+        }
+        Ok(Self { ranges })
+    }
+
+    /// 用单个端口构造（供代码内使用）。
     pub fn single(port: u16) -> Self {
         Self {
             ranges: vec![(port, port)],
@@ -97,6 +124,11 @@ impl AllowPorts {
     }
 }
 
+fn parse_port(text: &str) -> Result<u16> {
+    text.parse::<u16>()
+        .map_err(|_| anyhow::anyhow!("`{text}` 不是合法的端口号"))
+}
+
 /// frp 的 `allowPorts` 数组形式里的一项。
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
@@ -113,32 +145,46 @@ impl<'de> Deserialize<'de> for AllowPorts {
     {
         use serde::de::Error;
 
-        let entries = Vec::<AllowPortsEntry>::deserialize(deserializer)?;
-        let mut ranges = Vec::with_capacity(entries.len());
-        for entry in entries {
-            match (entry.single, entry.start, entry.end) {
-                (Some(port), None, None) => {
-                    if port == 0 {
-                        return Err(D::Error::custom("端口不能为 0"));
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Repr {
+            /// 简写：`allowPorts = "6000-6010,7000"`
+            Short(String),
+            /// frp 的数组写法
+            Ranges(Vec<AllowPortsEntry>),
+        }
+
+        let repr = Repr::deserialize(deserializer)?;
+        match repr {
+            Repr::Short(text) => AllowPorts::parse(&text).map_err(D::Error::custom),
+            Repr::Ranges(entries) => {
+                let mut ranges = Vec::with_capacity(entries.len());
+                for entry in entries {
+                    match (entry.single, entry.start, entry.end) {
+                        (Some(port), None, None) => {
+                            if port == 0 {
+                                return Err(D::Error::custom("端口不能为 0"));
+                            }
+                            ranges.push((port, port));
+                        }
+                        (None, Some(start), Some(end)) => {
+                            if start > end {
+                                return Err(D::Error::custom(format!(
+                                    "端口范围 {start}-{end} 的起始端口大于结束端口"
+                                )));
+                            }
+                            ranges.push((start, end));
+                        }
+                        _ => {
+                            return Err(D::Error::custom(
+                                "端口范围需要写成 { single = 6000 } 或 { start = 6000, end = 6010 }",
+                            ));
+                        }
                     }
-                    ranges.push((port, port));
                 }
-                (None, Some(start), Some(end)) => {
-                    if start > end {
-                        return Err(D::Error::custom(format!(
-                            "端口范围 {start}-{end} 的起始端口大于结束端口"
-                        )));
-                    }
-                    ranges.push((start, end));
-                }
-                _ => {
-                    return Err(D::Error::custom(
-                        "远端口范围需要写成 { single = 6000 } 或 { start = 6000, end = 6010 }",
-                    ));
-                }
+                Ok(AllowPorts { ranges })
             }
         }
-        Ok(AllowPorts { ranges })
     }
 }
 
@@ -678,6 +724,27 @@ mod tests {
         assert_eq!(cfg.proxies[0].local_ip, "127.0.0.1");
     }
 
+    /// type 可以省略，与 frp 一致默认为 tcp。
+    #[test]
+    fn type_can_be_omitted_like_frp() {
+        let cfg: ClientConfig = toml::from_str(
+            r#"
+            serverAddr = "127.0.0.1"
+            serverPort = 7000
+            token = "t"
+
+            [[proxies]]
+            name = "test-tcp"
+            localIP = "127.0.0.1"
+            localPort = 22
+            remotePort = 6000
+            "#,
+        )
+        .unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(cfg.proxies[0].proxy_type, "tcp");
+    }
+
     #[test]
     fn rejects_non_tcp_proxy_type() {
         let cfg: ClientConfig = toml::from_str(
@@ -819,6 +886,52 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("poolCount"), "{err}");
+    }
+
+    #[test]
+    fn allow_ports_string_form() {
+        let cfg: ServerConfig = toml::from_str(
+            r#"
+            token = "a"
+            allowPorts = "6000,7000-7002"
+            "#,
+        )
+        .unwrap();
+        assert!(cfg.allow_ports.allows(6000));
+        assert!(!cfg.allow_ports.allows(6001));
+        assert!(cfg.allow_ports.allows(7002));
+        assert!(!cfg.allow_ports.allows(7003));
+        assert_eq!(cfg.allow_ports.describe(), "6000,7000-7002");
+
+        // 字符串写法的校验
+        assert!(AllowPorts::parse("abc").is_err());
+        assert!(AllowPorts::parse("7000-6000").is_err());
+        assert!(AllowPorts::parse("99999").is_err());
+        assert!(AllowPorts::parse("").unwrap().is_unrestricted());
+    }
+
+    /// 数组写法与字符串写法等价。
+    #[test]
+    fn allow_ports_forms_are_equivalent() {
+        let array: ServerConfig = toml::from_str(
+            r#"
+            token = "a"
+            allowPorts = [
+                { start = 6000, end = 6010 },
+                { single = 7000 },
+            ]
+            "#,
+        )
+        .unwrap();
+        let string: ServerConfig = toml::from_str(
+            r#"
+            token = "a"
+            allowPorts = "6000-6010,7000"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(array.allow_ports, string.allow_ports);
+        assert_eq!(array.allow_ports.describe(), string.allow_ports.describe());
     }
 
     #[test]

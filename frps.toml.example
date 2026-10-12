@@ -4,11 +4,13 @@
 bindPort = 7000
 token = "change-me"
 
-# 允许客户端申请的远端端口，不配置 = 不限制。与 frp 相同的写法：
-allowPorts = [
-    { start = 6000, end = 6010 },
-    { single = 7000 },
-]
+# 允许客户端申请的远端端口，不配置 = 不限制。
+allowPorts = "6000-6010,7000"
+# 与 frp 相同的数组写法，等价于上面：
+# allowPorts = [
+#     { start = 6000, end = 6010 },
+#     { single = 7000 },
+# ]
 
 # 其它可选配置（把每段前的注释去掉即可启用）：
 #

@@ -3,6 +3,57 @@
 本文件按版本分段，release 页面会自动取对应段落作为更新说明。
 发新版本时：把 `Cargo.toml` 的 `version`、这里的新段落、git tag 三者保持一致。
 
+## 1.0.1
+
+配置格式对齐官方 frp，从 frp 迁移过来的配置可以直接使用。
+
+### 破坏性变更
+
+1.0.0 使用的是自创的 snake_case 字段名（`bind_port` / `local_addr` /
+`health_check_type`），1.0.1 起改为与官方 frp 完全一致的写法。
+旧写法不再支持，写错会直接报错并指出位置。
+
+| 1.0.0 写法 | 1.0.1 写法 |
+| --- | --- |
+| `bind_port` | `bindPort` |
+| `server_addr` / `server_port` | `serverAddr` / `serverPort` |
+| `local_addr` | `localIP` |
+| `remote_port` / `local_port` | `remotePort` / `localPort` |
+| `allow_ports` | `allowPorts` |
+| `pool_count` | `poolCount` |
+| `heartbeat_interval` / `tcp_keepalive` 等 | 收进 `[transport]` 段 |
+| `health_check_type` 等四项 | 收进 `[proxies.healthCheck]` 表 |
+| `log_level` | 收进 `[log]` 段的 `level` |
+| `proxy_protocol_version` | `proxyProtocolVersion` |
+
+### 新增
+
+- **代理类型字段** `type`：与 frp 一致，可省略，默认 `tcp`。
+  写成 `udp` 等未实现的类型会明确报错，而不是静默忽略
+- **`allowPorts` 支持 frp 的数组写法**
+  `[{ start = 6000, end = 6010 }, { single = 7000 }]`，
+  同时保留 `"6000-6010,7000"` 字符串简写，两者等价
+
+### 配置示例
+
+```toml
+# frps.toml
+bindPort = 7000
+token = "change-me"
+allowPorts = "6000-6010,7000"
+
+# frpc.toml
+serverAddr = "127.0.0.1"
+serverPort = 7000
+token = "change-me"
+
+[[proxies]]
+name = "test-tcp"
+localIP = "127.0.0.1"
+localPort = 22
+remotePort = 6000
+```
+
 ## 1.0.0
 
 首个正式版本。纯 TCP 的内网穿透实现，不加密、不压缩，全局 Token 认证。

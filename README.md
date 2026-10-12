@@ -254,10 +254,12 @@ bindPort = 7000
 token = "change-me"
 
 # 不配置 = 不限制
-allowPorts = [
-    { start = 6000, end = 6010 },
-    { single = 7000 },
-]
+allowPorts = "6000-6010,7000"
+# 也支持 frp 的数组写法，等价：
+# allowPorts = [
+#     { start = 6000, end = 6010 },
+#     { single = 7000 },
+# ]
 
 # ---- 以下是可选项，用默认值即可 ----
 bindAddr = "0.0.0.0"          # 控制端口绑定的地址
@@ -284,7 +286,7 @@ token = "change-me"
 
 [[proxies]]
 name = "test-tcp"
-type = "tcp"                  # 目前只支持 tcp，可省略
+type = "tcp"                  # 可省略，与 frp 一致默认 tcp（目前也只支持 tcp）
 localIP = "127.0.0.1"         # 可省略，默认 127.0.0.1
 localPort = 22
 remotePort = 6000             # 访问 <serverAddr>:6000 等于访问本机 22 端口
