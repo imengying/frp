@@ -296,7 +296,7 @@ checksum = "aedcfb3409746eddb02b9e19ebda1c3394f759a152e48ee875a0844d1b955484"
 
 [[package]]
 name = "frp-client"
-version = "1.0.2"
+version = "1.0.3"
 dependencies = [
  "anyhow",
  "clap",
@@ -308,7 +308,7 @@ dependencies = [
 
 [[package]]
 name = "frp-core"
-version = "1.0.2"
+version = "1.0.3"
 dependencies = [
  "anyhow",
  "rcgen",
@@ -326,7 +326,7 @@ dependencies = [
 
 [[package]]
 name = "frp-server"
-version = "1.0.2"
+version = "1.0.3"
 dependencies = [
  "anyhow",
  "clap",
@@ -337,7 +337,7 @@ dependencies = [
 
 [[package]]
 name = "frp-tests"
-version = "1.0.2"
+version = "1.0.3"
 dependencies = [
  "anyhow",
  "frp-client",

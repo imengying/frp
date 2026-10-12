@@ -31,7 +31,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::timeout;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// 等待连接发送首条消息（登录 / 工作连接握手）的超时。
 const FIRST_MSG_TIMEOUT: Duration = Duration::from_secs(10);
@@ -187,7 +187,16 @@ impl Server {
                             match shared.accept_tls(stream).await {
                                 Ok(stream) => {
                                     if let Err(err) = handle_conn(shared, stream, peer).await {
-                                        debug!("连接 {peer} 处理结束: {err:#}");
+                                        // 普通断开（客户端退出、网络抖动）很常见，
+                                        // 用 debug 免得刷屏；但 TLS 配置不匹配会让
+                                        // 所有连接都失败，属于必须让管理员看到的问题，
+                                        // 所以用 error——它是默认日志级别能输出的最低等级。
+                                        let text = format!("{err:#}");
+                                        if text.contains("TLS") {
+                                            error!("连接 {peer} 处理失败: {text}");
+                                        } else {
+                                            debug!("连接 {peer} 处理结束: {text}");
+                                        }
                                     }
                                 }
                                 Err(err) => {

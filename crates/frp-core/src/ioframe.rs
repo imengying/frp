@@ -38,6 +38,16 @@ where
     }
     let len = u32::from_be_bytes(len_buf);
     if len == 0 || len > MAX_FRAME_LEN {
+        // 首字节能区分出最常见的一种误配：对端在用 TLS，而本端没有启用。
+        // TLS 标记（0x17）或 ClientHello（0x16）会被这里当成消息长度的高位字节，
+        // 得出一个巨大的数值。直接点明原因，比只报「非法长度」有用得多。
+        let first = len_buf[0];
+        if first == crate::tls::TLS_HEAD_BYTE || first == 0x16 {
+            bail!(
+                "非法的消息长度: {len}。看起来对端启用了 TLS 而本端没有——\
+                 请检查两端 [transport.tls] 的 enable 设置是否一致"
+            );
+        }
         bail!("非法的消息长度: {len}");
     }
     let mut buf = vec![0u8; len as usize];
