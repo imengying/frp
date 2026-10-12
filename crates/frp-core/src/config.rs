@@ -21,14 +21,16 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields, rename_all = "camelCase")]
 pub struct LogConfig {
-    /// trace / debug / info / warn / error
+    /// trace / debug / info / warn / error，默认 `error`。
     pub level: String,
 }
 
 impl Default for LogConfig {
     fn default() -> Self {
+        // 默认只记录 error：避免默认配置下刷屏（例如公网上的扫描流量、
+        // 客户端的重连噪音）。需要时在配置里调高，或用 RUST_LOG 临时覆盖。
         Self {
-            level: "info".into(),
+            level: "error".into(),
         }
     }
 }
@@ -978,6 +980,18 @@ mod tests {
     fn rejects_snake_case_names() {
         let err = toml::from_str::<ServerConfig>("token = \"a\"\nbind_port = 7000\n").unwrap_err();
         assert!(err.to_string().contains("bind_port"), "{err}");
+    }
+
+    /// 默认日志级别是 error：正常运行时不该刷屏。
+    #[test]
+    fn default_log_level_is_error() {
+        assert_eq!(LogConfig::default().level, "error");
+        assert_eq!(ServerConfig::default().log.level, "error");
+        assert_eq!(ClientConfig::default().log.level, "error");
+
+        // 配置里不写 [log] 时也用这个默认值
+        let cfg: ServerConfig = toml::from_str("token = \"a\"\n").unwrap();
+        assert_eq!(cfg.log.level, "error");
     }
 
     #[test]

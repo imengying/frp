@@ -40,6 +40,11 @@ use tracing::{debug, info, warn};
 const FIRST_MSG_TIMEOUT: Duration = Duration::from_secs(10);
 /// 每个控制连接的消息队列长度。
 const CONTROL_QUEUE: usize = 128;
+/// 等待控制连接的消息队列腾出空间的上限。
+///
+/// 心跳应答要送达（否则客户端会误判连接失效），队列满时等一会儿；
+/// 但客户端若彻底卡死，读循环不能被无限拖住，所以设这个上限。
+const HEARTBEAT_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
 /// 池中空闲工作连接的最长闲置时间，超过则由服务端主动关闭。
 const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -611,15 +616,23 @@ async fn control_read_loop(
             }
             Ok(Err(err)) => return Err(err.context(format!("读取 {peer} 的控制消息失败"))),
             Ok(Ok(Some(msg))) => match msg {
-                Message::Heartbeat => match out_tx.try_send(Message::HeartbeatResp) {
-                    Ok(()) => {}
-                    Err(mpsc::error::TrySendError::Full(_)) => {
-                        debug!("{peer} 的控制消息队列已满，丢弃一次心跳应答");
+                // 心跳应答必须送达：客户端以「一段时间内没收到任何消息」判定
+                // 连接失效，丢一次应答就可能让它误重连（明明连接是好的）。
+                // 队列满说明客户端处理慢，这里等一会儿而不是丢弃；
+                // 但也不能无限等——客户端若彻底卡死，这个读循环会被拖住，
+                // 连心跳超时都检测不到，所以给个上限。
+                Message::Heartbeat => {
+                    match timeout(HEARTBEAT_REPLY_TIMEOUT, out_tx.send(Message::HeartbeatResp))
+                        .await
+                    {
+                        Ok(Ok(())) => {}
+                        Ok(Err(_)) => bail!("{peer} 的控制连接已关闭"),
+                        Err(_) => bail!(
+                            "{peer} 的控制消息队列持续 {}s 无法写入，判定为异常",
+                            HEARTBEAT_REPLY_TIMEOUT.as_secs()
+                        ),
                     }
-                    Err(mpsc::error::TrySendError::Closed(_)) => {
-                        bail!("{peer} 的控制连接已关闭");
-                    }
-                },
+                }
                 // 客户端健康检查恢复后重新注册代理
                 Message::NewProxy { proxy } => {
                     let name = proxy.name.clone();

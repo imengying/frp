@@ -45,12 +45,21 @@ async fn run(args: Args) -> Result<()> {
     log::init(&cfg.log.level);
 
     if args.check {
-        tracing::info!("配置校验通过: {}", args.config.display());
+        // 直接写 stdout：这是命令的直接反馈，不该被日志级别过滤掉
+        println!("配置校验通过: {}", args.config.display());
         return Ok(());
     }
 
     let mut server = Server::new(cfg)?;
     let addr = server.bind().await?;
+    // 启动确认直接写 stderr：默认日志级别是 error，若走日志这里会是静默的，
+    // 让人以为进程没起来。这行保证「启动成功」始终可见。
+    eprintln!(
+        "frps 已启动: 控制端口 {addr}，代理端口绑定于 {}，允许端口 {}（日志级别 {}，可用 [log] level 或 RUST_LOG 调整）",
+        server.config().proxy_bind_addr(),
+        server.config().allow_ports.describe(),
+        server.config().log.level,
+    );
     tracing::info!(
         "frps 已启动: 控制端口 {addr}，代理端口绑定于 {}，允许端口 {}",
         server.config().proxy_bind_addr(),

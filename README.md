@@ -274,7 +274,7 @@ workConnTimeout = 10          # 等客户端建立工作连接的超时
 tcpKeepalive = 60             # TCP keepalive 间隔，0 = 系统默认
 
 [log]
-level = "info"                # RUST_LOG 环境变量优先
+level = "error"               # 默认就是 error（只记录错误），需要排查时调高
 ```
 
 ### 客户端 `frpc.toml`
@@ -309,8 +309,18 @@ dialLocalTimeout = 10         # 连接本地服务超时
 tcpKeepalive = 60
 
 [log]
-level = "info"
+level = "error"               # 默认就是 error（只记录错误），需要排查时调高
 ```
+
+> 日志级别默认是 `error`，正常运行时不会刷屏。需要看连接、重连、代理注册等
+> 过程信息时，在配置里设 `level = "info"`（或 `"debug"` 看更细的转发过程），
+> 也可以用环境变量临时覆盖而不改配置：
+>
+> ```bash
+> RUST_LOG=info frpc -c /etc/frp/frpc.toml
+> ```
+>
+> 不管级别如何，「启动成功」和 `--check` 的结果始终会打印出来。
 
 `reconnectInitialDelay` / `reconnectMaxDelay` 控制断线重连的退避区间
 （默认 1s / 30s），这是 frp 没有的扩展项。

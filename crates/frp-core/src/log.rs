@@ -76,7 +76,7 @@ where
 pub fn init(level: &str) {
     let filter = EnvFilter::try_from_default_env()
         .or_else(|_| EnvFilter::try_new(level))
-        .unwrap_or_else(|_| EnvFilter::new("info"));
+        .unwrap_or_else(|_| EnvFilter::new("error"));
 
     // 重复初始化（例如同一进程内多次调用）时忽略错误。
     let _ = tracing_subscriber::fmt()
@@ -168,7 +168,7 @@ mod tests {
 
     #[test]
     fn init_is_idempotent() {
-        init("info");
+        init("error");
         init("debug"); // 已经初始化过，不应 panic
     }
 }

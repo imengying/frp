@@ -35,4 +35,4 @@ remotePort = 6000
 # tcpKeepalive = 60
 #
 # [log]
-# level = "info"
+# level = "error"

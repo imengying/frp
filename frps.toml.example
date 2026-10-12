@@ -25,4 +25,4 @@ allowPorts = "6000-6010,7000"
 # tcpKeepalive = 60
 #
 # [log]
-# level = "info"
+# level = "error"

@@ -778,3 +778,163 @@ async fn rejects_invalid_proxy_protocol_version() {
     let err = cfg.validate().unwrap_err().to_string();
     assert!(err.contains("proxyProtocolVersion"), "{err}");
 }
+
+/// 连接池在「有长连接占用」的情况下也必须保持满额。
+///
+/// 这里抓的是一个真实缺陷：连接池的补充原先只在「池中连接结束」时触发，
+/// 而已被启用的连接如果是个长连接（SSH 会话这种），它既不结束、也不再是
+/// 空闲连接。结果是：池子被一条条消耗，`inflight` 计数却不变，
+/// 后续访问全部退化成按需建立——连接池形同虚设，而且没有任何报错。
+///
+/// 判据用「客户端到服务端的 TCP 连接数」：
+/// 满额时应有 1 条控制连接 + pool_count 条池连接 + 被占用的工作连接。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pool_stays_filled_while_long_lived_connection_occupies_it() {
+    // 本地服务：握手后一直不主动关闭，用来模拟长连接
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let local = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            tokio::spawn(async move {
+                let mut buf = [0u8; 1024];
+                loop {
+                    match stream.read(&mut buf).await {
+                        Ok(0) | Err(_) => return,
+                        // 原样回显，但不断开
+                        Ok(n) => {
+                            if stream.write_all(&buf[..n]).await.is_err() {
+                                return;
+                            }
+                        }
+                    }
+                }
+            });
+        }
+    });
+
+    let remote_port = reserve_port();
+    let (server, _guard) = start_server(AllowPorts::default()).await;
+    let mut cfg = ClientSpec {
+        server,
+        proxy_name: "longlived",
+        remote_port,
+        local_host: &local.ip().to_string(),
+        local_port: local.port(),
+    }
+    .into_config();
+    cfg.proxies[0].pool_count = 2;
+    let _client = start_client(cfg);
+    wait_remote_ready(remote_port).await;
+
+    // 等连接池预热
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    /// 数当前会话用到的工作连接数（即客户端到服务端的连接总数）。
+    fn established(server_port: u16) -> usize {
+        let out = std::process::Command::new("ss")
+            .args(["-tn"])
+            .output()
+            .expect("执行 ss 失败");
+        let text = String::from_utf8_lossy(&out.stdout);
+        text.lines()
+            .filter(|line| line.contains(&format!(":{server_port}")))
+            .count()
+    }
+
+    // ss 每个连接输出两行（两个方向），所以 1 控制 + 2 池 = 3 条连接 → 6 行
+    let baseline = established(server.port());
+    assert!(
+        baseline >= 6,
+        "连接池应已预热出 2 条空闲连接（连同控制连接共 3 条，ss 输出 6 行），实际 {baseline} 行"
+    );
+
+    // 开一个长连接占住池中的一条，并保持不关闭
+    let mut long_lived = TcpStream::connect(("127.0.0.1", remote_port))
+        .await
+        .unwrap();
+    long_lived.write_all(b"hold").await.unwrap();
+    let mut buf = [0u8; 4];
+    timeout(Duration::from_secs(5), long_lived.read_exact(&mut buf))
+        .await
+        .expect("长连接握手超时")
+        .unwrap();
+
+    // 长连接占用后，池子应当立刻补上一条新的空闲连接，
+    // 因此「控制连接 + 被占用的 1 条 + 新补的空闲 2 条」总共仍是 4 条 → 8 行。
+    let mut refilled = 0;
+    for _ in 0..40 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        refilled = established(server.port());
+        if refilled >= 8 {
+            break;
+        }
+    }
+    assert!(
+        refilled >= 8,
+        "长连接占用池中连接后，连接池没有补满：期望至少 8 行（4 条连接），实际 {refilled} 行。\
+         说明「已被启用的池连接」没有被计入消耗，补池逻辑漏掉了这种情况"
+    );
+
+    // 长连接仍然可用（数据能往返）
+    long_lived.write_all(b"ping").await.unwrap();
+    timeout(Duration::from_secs(5), long_lived.read_exact(&mut buf))
+        .await
+        .expect("长连接回显超时")
+        .unwrap();
+    assert_eq!(&buf, b"ping");
+}
+
+/// 空闲时连接池不应无谓地反复重建。
+///
+/// 服务端会回收闲置超过 POOL_IDLE_TIMEOUT 的池中连接，客户端发现连接被关闭后
+/// 立刻补一条新的。如果回收时间 < 客户端等待超时，池子就会周期性重建——
+/// 代理长期空闲时（例如一个几小时没人连的 SSH 代理）这纯属浪费，
+/// 还会在日志里刷出一堆噪音。
+///
+/// 这里用「服务端观察到的池连接入池次数」来判定：若空闲期间反复重建，
+/// 入池次数会远大于 poolCount。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pool_does_not_thrash_when_idle() {
+    let (host, local_port) = start_echo_server().await;
+    let remote_port = reserve_port();
+    // 用 debug 级日志，便于统计池连接入池次数
+    let (server, _guard) = start_server(AllowPorts::default()).await;
+    let mut cfg = ClientSpec {
+        server,
+        proxy_name: "idle",
+        remote_port,
+        local_host: &host,
+        local_port,
+    }
+    .into_config();
+    cfg.proxies[0].pool_count = 2;
+    let _client = start_client(cfg);
+    wait_remote_ready(remote_port).await;
+
+    // 等预热完成，记录初始连接数（1 控制 + 2 池 = 3 条 → ss 输出 6 行）
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let count = |port: u16| {
+        let out = std::process::Command::new("ss")
+            .args(["-tn"])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter(|l| l.contains(&format!(":{port}")))
+            .count()
+    };
+
+    let before = count(server.port());
+    assert!(before >= 6, "预热后应有 3 条连接，实际 {before} 行");
+
+    // 什么都不做，静置一小段时间（不足以触发服务端 60s 回收）
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let after = count(server.port());
+    assert_eq!(
+        after, before,
+        "空闲 3 秒期间连接数发生了变化（{before} -> {after}），池子不应无故抖动"
+    );
+}

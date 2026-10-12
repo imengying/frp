@@ -442,9 +442,15 @@ async fn on_demand_work_conn(
 /// 这是池中连接的完整生命周期：握手 -> 等 `StartWorkConn` -> 连本地服务 ->
 /// 双向转发。因此它必须一直持有这条连接的读写两端，不能提前返回。
 ///
-/// 无论以何种方式结束，都会通过 `finished_tx` 通知维护任务补充一条新连接。
+/// 补充时机很关键：**连接一旦被启用就立刻回报**，因为此刻它已经从
+/// 「空闲连接」变成「正在服务的连接」，池子缺了一个名额。
+/// 如果只在连接结束时回报，那么 SSH 这类长连接会把名额一直占着，
+/// 池子被逐条消耗却得不到补充，最终退化成按需建立。
 async fn pooled_work_conn(ctx: SessionCtx, proxy: ProxyConfig, finished_tx: mpsc::Sender<String>) {
     let dial_timeout = Duration::from_secs(10);
+    // 是否已经在「被启用」时回报过；用于避免函数结束时重复回报
+    let mut reported = false;
+
     let result = async {
         let mut stream = connect_tcp(&ctx.server, 0)
             .await
@@ -472,6 +478,11 @@ async fn pooled_work_conn(ctx: SessionCtx, proxy: ProxyConfig, finished_tx: mpsc
             );
         }
         debug!("代理 `{}` 的池中连接已被启用", proxy.name);
+
+        // 名额已被消耗，立刻回报让维护任务补一条（无论这条连接之后持续多久）
+        reported = true;
+        let _ = finished_tx.send(proxy.name.clone()).await;
+
         forward_to_local(stream, &proxy, dial_timeout).await
     }
     .await;
@@ -479,8 +490,11 @@ async fn pooled_work_conn(ctx: SessionCtx, proxy: ProxyConfig, finished_tx: mpsc
     if let Err(err) = result {
         debug!("代理 `{}` 的空闲工作连接结束: {err:#}", proxy.name);
     }
-    // 通知维护任务补充（接收端可能已关闭，说明会话结束，忽略即可）
-    let _ = finished_tx.send(proxy.name.clone()).await;
+    // 未启用就结束（握手失败、等待超时等）：此时名额还没补过，这里补上。
+    // 已经启用过的连接不再重复回报，否则会让池子越补越多。
+    if !reported {
+        let _ = finished_tx.send(proxy.name.clone()).await;
+    }
 }
 
 /// 池中连接等待被服务端启用的最长时间。
