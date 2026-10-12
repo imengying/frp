@@ -101,19 +101,15 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # ---- Linux x86_64 ----
+          # ---- x86_64 ----
           - { os: ubuntu-24.04, target: x86_64-unknown-linux-gnu }
           # musl 静态链接：任何发行版通用，也是 Alpine + OpenRC 的主流选择
           - { os: ubuntu-24.04, target: x86_64-unknown-linux-musl }
-          # ---- Linux aarch64 / armv7 ----
+          # ---- aarch64 ----
           - { os: ubuntu-24.04, target: aarch64-unknown-linux-gnu, cross: true }
           - { os: ubuntu-24.04, target: aarch64-unknown-linux-musl, cross: true }
+          # ---- armv7 ----
           - { os: ubuntu-24.04, target: armv7-unknown-linux-musleabihf, cross: true }
-          # ---- macOS ----
-          - { os: macos-14, target: x86_64-apple-darwin }
-          - { os: macos-14, target: aarch64-apple-darwin }
-          # ---- Windows ----
-          - { os: windows-2022, target: x86_64-pc-windows-msvc }
     steps:
       - uses: actions/checkout@v4
 
@@ -222,16 +218,16 @@ jobs:
 
             ## 下载
 
-            服务端与客户端**分为两个包**，按需取用：
+            服务端与客户端**分为两个包**，按需取用（当前仅提供 Linux）：
 
             | 平台 | 服务端 / 客户端 |
             | --- | --- |
-            | Linux x86_64 | `frps_v${{ needs.prepare.outputs.number }}_x86_64-unknown-linux-gnu.tar.gz` / `frpc_...` |
-            | Linux x86_64（静态，任意发行版、Alpine 通用） | `..._x86_64-unknown-linux-musl.tar.gz` |
-            | Linux ARM64 | `..._aarch64-unknown-linux-{gnu,musl}.tar.gz` |
-            | Linux ARMv7 | `..._armv7-unknown-linux-musleabihf.tar.gz` |
-            | macOS（Intel / Apple Silicon） | `..._x86_64-apple-darwin.tar.gz` / `..._aarch64-apple-darwin.tar.gz` |
-            | Windows | `..._x86_64-pc-windows-msvc.zip` |
+            | x86_64 | `frps_v${{ needs.prepare.outputs.number }}_x86_64-unknown-linux-gnu.tar.gz` / `frpc_...` |
+            | x86_64（静态，任意发行版、Alpine 通用） | `..._x86_64-unknown-linux-musl.tar.gz` |
+            | ARM64 | `..._aarch64-unknown-linux-{gnu,musl}.tar.gz` |
+            | ARMv7 | `..._armv7-unknown-linux-musleabihf.tar.gz` |
+
+            静态（musl）版不依赖系统 libc，拷到任何 Linux 上都能直接跑。
 
             ## 安装
 

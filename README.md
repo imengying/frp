@@ -78,11 +78,15 @@ sudo install -m644 frpc.toml.example /etc/frp/frpc.toml
 $EDITOR /etc/frp/frpc.toml     # 改 token、server_addr
 ```
 
-包命名规则：`frps_<版本>_<平台>.tar.gz`、`frpc_<版本>_<平台>.tar.gz`
-（Windows 为 `.zip`）。版本号与 tag 一致。
+包命名规则：`frps_<版本>_<平台>.tar.gz`、`frpc_<版本>_<平台>.tar.gz`。
+版本号与 tag 一致。
 
-支持平台：x86_64 / aarch64 / armv7 的 Linux（glibc 与 musl 静态），
-macOS（Intel / Apple Silicon），Windows。
+支持平台：x86_64 / aarch64 / armv7 的 Linux，glibc 与 musl 静态两种。
+静态（musl）版不依赖系统 libc，拷到任何 Linux 上都能直接跑，也适合 Alpine。
+
+> 目前只发布 Linux 版本。代码本身没有写死平台（构建、信号处理都做了条件编译），
+> 需要 macOS / Windows 时在 `.github/workflows/release.yml` 的 matrix 里加回对应
+> 目标即可。
 
 更新日志见 [CHANGELOG.md](CHANGELOG.md)，release 页面会显示对应版本的段落。
 

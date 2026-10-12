@@ -21,8 +21,6 @@ jobs:
         run: |
           rustup toolchain install stable --profile minimal --component rustfmt,clippy
           rustup default stable
-          # Windows 目标用于交叉编译检查（见最后一步）
-          rustup target add x86_64-pc-windows-msvc
           rustc --version
 
       - uses: Swatinem/rust-cache@v2
@@ -33,19 +31,9 @@ jobs:
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets
 
-      # 平台相关的 cfg 分支只有在对应目标上编译才会暴露问题
-      # （例如 Windows 上出现不可达语句时，`-D warnings` 会让它直接失败）。
-      # 本机跑不了 Windows 测试，但至少保证它编译得过。
-      - name: cargo check（Windows 目标）
-        run: cargo check --workspace --all-targets --target x86_64-pc-windows-msvc
-
   test:
-    name: 测试 (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-24.04, macos-14, windows-2022]
+    name: 测试
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
 
