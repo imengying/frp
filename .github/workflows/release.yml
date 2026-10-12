@@ -30,13 +30,14 @@ jobs:
   prepare:
     name: 解析版本
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
     outputs:
       version: ${{ steps.parse.outputs.version }}
       number: ${{ steps.parse.outputs.number }}
       is_tag: ${{ steps.parse.outputs.is_tag }}
       notes: ${{ steps.parse.outputs.notes }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
 
       # tag 说 v1.0.0、二进制里却是别的版本，是最容易出的低级错误。
       # 这里直接挡住，避免发出去的包 `--version` 和 release 标题对不上。
@@ -97,21 +98,26 @@ jobs:
     name: 构建 ${{ matrix.target }}
     needs: prepare
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
+        # 这份列表必须与 ci.yml 的「打包冒烟测试」保持一致：
+        # CI 会在每次推送时把每个目标都构建一遍，避免发布当天才发现某个
+        # 目标编译不过（TLS 引入的 ring 是 C 代码，交叉编译需要额外工具链，
+        # 只在 x86_64-gnu 上测会漏掉 musl）。
         include:
           # ---- x86_64 ----
-          - { os: ubuntu-24.04, target: x86_64-unknown-linux-gnu }
+          - { os: ubuntu-24.04, target: x86_64-unknown-linux-gnu, native: true }
           # musl 静态链接：任何发行版通用，也是 Alpine + OpenRC 的主流选择
-          - { os: ubuntu-24.04, target: x86_64-unknown-linux-musl }
+          - { os: ubuntu-24.04, target: x86_64-unknown-linux-musl, native: true }
           # ---- aarch64 ----
-          - { os: ubuntu-24.04, target: aarch64-unknown-linux-gnu, cross: true }
-          - { os: ubuntu-24.04, target: aarch64-unknown-linux-musl, cross: true }
+          - { os: ubuntu-24.04, target: aarch64-unknown-linux-gnu, native: false }
+          - { os: ubuntu-24.04, target: aarch64-unknown-linux-musl, native: false }
           # ---- armv7 ----
-          - { os: ubuntu-24.04, target: armv7-unknown-linux-musleabihf, cross: true }
+          - { os: ubuntu-24.04, target: armv7-unknown-linux-musleabihf, native: false }
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
 
       - name: 安装工具链
         run: |
@@ -120,22 +126,47 @@ jobs:
           rustup target add ${{ matrix.target }}
         shell: bash
 
-      - uses: Swatinem/rust-cache@v2
+      # ring（TLS 的加密后端）含 C 代码，构建时需要对应目标的 C 工具链。
+      # musl 目标不能用 glibc 的 gcc，需要 musl-gcc；交叉目标由 cross 的
+      # 容器提供工具链，本机不用装。
+      - name: 安装 C 工具链
+        if: matrix.native
+        run: |
+          set -euo pipefail
+          if [[ "${{ matrix.target }}" == *musl* ]]; then
+            sudo apt-get update
+            sudo apt-get install -y musl-tools
+          fi
+        shell: bash
+
+      - uses: Swatinem/rust-cache@v2.9.2
         with:
           key: ${{ matrix.target }}
 
       - name: 安装 cross
-        if: matrix.cross
+        if: matrix.native == false
         run: cargo install cross --locked
         shell: bash
 
+      - name: 配置 musl 链接器（原生）
+        if: matrix.native && contains(matrix.target, 'musl')
+        run: |
+          # musl-gcc 同时充当编译器与链接器
+          {
+            echo "CC_${RUST_TARGET//-/_}=musl-gcc"
+            echo "CARGO_TARGET_${RUST_TARGET^^}_LINKER=musl-gcc"
+          } >> "$GITHUB_ENV"
+        env:
+          RUST_TARGET: ${{ matrix.target }}
+        shell: bash
+
       - name: 构建（原生）
-        if: ${{ !matrix.cross }}
+        if: matrix.native
         run: cargo build --release --locked --target ${{ matrix.target }}
         shell: bash
 
       - name: 构建（交叉）
-        if: matrix.cross
+        if: matrix.native == false
         run: cross build --release --locked --target ${{ matrix.target }}
         shell: bash
 
@@ -153,7 +184,7 @@ jobs:
           ls -la dist
 
       - name: 上传构建产物
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: ${{ matrix.target }}
           path: |
@@ -170,11 +201,12 @@ jobs:
     needs: [prepare, build]
     if: needs.prepare.outputs.is_tag == 'true'
     runs-on: ubuntu-24.04
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
 
       - name: 下载全部产物
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8.0.2
         with:
           merge-multiple: true
           path: assets
@@ -221,12 +253,15 @@ jobs:
           done
 
       - name: 创建 release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3.0.3
         with:
           # tag_name 用触发本次运行的 tag：release 版本 == 你打的 tag
           tag_name: ${{ github.ref_name }}
           name: frp ${{ needs.prepare.outputs.version }}
           files: assets/*
+          # 产物一个都没匹配上就直接失败，别发一个空 release 出去
+          fail_on_unmatched_files: true
+          overwrite_files: true
           body: |
             ${{ needs.prepare.outputs.notes }}
           draft: false
