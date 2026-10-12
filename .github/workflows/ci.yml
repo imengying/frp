@@ -13,7 +13,7 @@ env:
 jobs:
   lint:
     name: 格式与静态检查
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
 
@@ -21,6 +21,8 @@ jobs:
         run: |
           rustup toolchain install stable --profile minimal --component rustfmt,clippy
           rustup default stable
+          # Windows 目标用于交叉编译检查（见最后一步）
+          rustup target add x86_64-pc-windows-msvc
           rustc --version
 
       - uses: Swatinem/rust-cache@v2
@@ -31,13 +33,19 @@ jobs:
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets
 
+      # 平台相关的 cfg 分支只有在对应目标上编译才会暴露问题
+      # （例如 Windows 上出现不可达语句时，`-D warnings` 会让它直接失败）。
+      # 本机跑不了 Windows 测试，但至少保证它编译得过。
+      - name: cargo check（Windows 目标）
+        run: cargo check --workspace --all-targets --target x86_64-pc-windows-msvc
+
   test:
     name: 测试 (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: [ubuntu-24.04, macos-14, windows-2022]
     steps:
       - uses: actions/checkout@v4
 
@@ -52,11 +60,11 @@ jobs:
         run: cargo test --workspace
 
   # 用与 release 完全相同的脚本打一次包，确保发布流程不会在打 tag 那天才炸。
-  # 这里能拦住的问题：包里少了二进制/配置示例、两个组件混进对方的东西、
+  # 能拦住的问题：包里少了二进制或配置示例、两个组件的包互相混杂、
   # 打包脚本语法错误、解包目录残留等。
   package:
     name: 打包冒烟测试
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
 
@@ -97,9 +105,9 @@ jobs:
             echo "== $pkg =="
 
             # 先把清单读进变量再用 grep 判断。
-            # 别写成 `tar tzf ... | grep -q`：grep -q 命中后会立刻退出，
-            # tar 因此收到 SIGPIPE 返回非 0，在 pipefail 下整条管道算失败，
-            # 判断就永远不成立，这个校验会静默失效。
+            # 不能写成 `tar tzf ... | grep -q`：grep -q 命中后立刻退出，
+            # tar 收到 SIGPIPE 返回非 0，在 pipefail 下整条管道算失败，
+            # 判断就永远不成立，校验会静默失效。
             local listing other
             listing=$(tar tzf "$pkg")
             echo "$listing"

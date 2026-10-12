@@ -46,37 +46,45 @@ crates/
   frp-server/  frps：控制连接、代理端口监听、工作连接配对、连接池
   frp-client/  frpc：登录、心跳、自动重连、健康检查、连接池、本地转发
   frp-tests/   端到端集成测试 + 示例配置校验
+scripts/
+  package.sh   打发布包（CI 与 release 共用同一份逻辑）
 .github/workflows/
-  ci.yml       格式、clippy、多平台测试
-  release.yml  打 tag 时分别构建发布 frps / frpc
+  ci.yml       格式、clippy、多平台测试、打包冒烟测试
+  release.yml  打 tag 时构建各平台包并发布一个 release
+CHANGELOG.md   更新日志（release 说明取自这里）
 ```
 
 ## 安装
 
 ### 从 release 下载
 
-frps 和 frpc **分开打包、分开发布**，各取所需：
-
-- 服务端 tag 形如 `frps-v1.0.0`，产物形如 `frps_v1.0.0_x86_64-unknown-linux-musl.tar.gz`
-- 客户端 tag 形如 `frpc-v1.0.0`，产物形如 `frpc_v1.0.0_x86_64-unknown-linux-musl.tar.gz`
+每个版本的 release 里同时包含服务端与客户端，按平台下载对应包：
 
 ```bash
-# 服务端
+# 服务端（以 Linux x86_64 静态版为例）
 tar xzf frps_v1.0.0_x86_64-unknown-linux-musl.tar.gz
 cd frps_v1.0.0_x86_64-unknown-linux-musl
 sudo install -m755 frps /usr/local/bin/
 sudo install -d /etc/frp
 sudo install -m644 frps.toml.example /etc/frp/frps.toml
 $EDITOR /etc/frp/frps.toml     # 至少改 token
+frps -c /etc/frp/frps.toml --check   # 部署前校验
 
 # 客户端（在另一台机器上同理）
+tar xzf frpc_v1.0.0_x86_64-unknown-linux-musl.tar.gz
+cd frpc_v1.0.0_x86_64-unknown-linux-musl
 sudo install -m755 frpc /usr/local/bin/
 sudo install -m644 frpc.toml.example /etc/frp/frpc.toml
 $EDITOR /etc/frp/frpc.toml     # 改 token、server_addr
 ```
 
+包命名规则：`frps_<版本>_<平台>.tar.gz`、`frpc_<版本>_<平台>.tar.gz`
+（Windows 为 `.zip`）。版本号与 tag 一致。
+
 支持平台：x86_64 / aarch64 / armv7 的 Linux（glibc 与 musl 静态），
 macOS（Intel / Apple Silicon），Windows。
+
+更新日志见 [CHANGELOG.md](CHANGELOG.md)，release 页面会显示对应版本的段落。
 
 ### 从源码
 
@@ -85,12 +93,17 @@ cargo build --release
 # 产物：target/release/frps 与 target/release/frpc
 ```
 
-发布时打两个 tag：
+### 发布新版本
+
+发版前把 `Cargo.toml` 的 `version` 与 `CHANGELOG.md` 同步好，然后打 tag：
 
 ```bash
-git tag frps-v1.0.0 && git push origin frps-v1.0.0
-git tag frpc-v1.0.0 && git push origin frpc-v1.0.0
+# 版本号三处必须一致（Cargo.toml / CHANGELOG / tag），
+# release workflow 会校验，不一致直接失败
+git tag -a v1.0.0 -m "frp v1.0.0" && git push origin v1.0.0
 ```
+
+推送后会自动构建各平台包并创建 release（标题 `frp v1.0.0`）。
 
 ## 用 systemd 管理
 
