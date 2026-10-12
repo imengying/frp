@@ -179,12 +179,8 @@ jobs:
           merge-multiple: true
           path: assets
 
-      - name: 生成校验和
-        run: |
-          set -euo pipefail
-          ls -la assets
-          (cd assets && sha256sum * > SHA256SUMS.txt)
-          cat assets/SHA256SUMS.txt
+      - name: 列出产物
+        run: ls -la assets
 
       # 校验 release 会落在哪个 tag 上。
       # 不用 `git fetch --depth=1`：浅克隆下取 tag 容易失败，
@@ -213,50 +209,5 @@ jobs:
           files: assets/*
           body: |
             ${{ needs.prepare.outputs.notes }}
-
-            ---
-
-            ## 下载
-
-            服务端与客户端**分为两个包**，按需取用（当前仅提供 Linux）：
-
-            | 平台 | 服务端 / 客户端 |
-            | --- | --- |
-            | x86_64 | `frps_v${{ needs.prepare.outputs.number }}_x86_64-unknown-linux-gnu.tar.gz` / `frpc_...` |
-            | x86_64（静态，任意发行版、Alpine 通用） | `..._x86_64-unknown-linux-musl.tar.gz` |
-            | ARM64 | `..._aarch64-unknown-linux-{gnu,musl}.tar.gz` |
-            | ARMv7 | `..._armv7-unknown-linux-musleabihf.tar.gz` |
-
-            静态（musl）版不依赖系统 libc，拷到任何 Linux 上都能直接跑。
-
-            ## 安装
-
-            ```bash
-            # 以 Linux x86_64 静态版为例
-            tar xzf frps_v${{ needs.prepare.outputs.number }}_x86_64-unknown-linux-musl.tar.gz
-            cd frps_v${{ needs.prepare.outputs.number }}_x86_64-unknown-linux-musl
-            sudo install -m755 frps /usr/local/bin/
-            sudo install -d /etc/frp
-            sudo install -m644 frps.toml.example /etc/frp/frps.toml
-            sudo vi /etc/frp/frps.toml           # 至少改 token
-            frps -c /etc/frp/frps.toml --check   # 部署前校验配置
-            ```
-
-            客户端同理，把 `frps` 换成 `frpc`，并把 `server_addr` 指向服务端。
-            两端 `token` 必须一致。
-
-            ## 配置与服务管理
-
-            完整的配置项说明、systemd unit 与 OpenRC 脚本，见包内 `README.md`
-            以及 `frps.toml.example` / `frpc.toml.example`。
-
-            停止服务发的是 SIGTERM：程序会先释放端口、断开客户端再退出，
-            所以重启不会遇到「端口被占用」。
-
-            ## 校验
-
-            ```bash
-            sha256sum -c SHA256SUMS.txt
-            ```
           draft: false
           prerelease: false

@@ -1,89 +1,30 @@
-# frpc —— frp 客户端配置示例（TCP 版）
-#
-# 用法: frpc -c /etc/frp/frpc.toml
-# 校验配置: frpc -c /etc/frp/frpc.toml --check
-
-# ---------------------------------------------------------------- 服务端
+# frpc 配置示例。未写的项都用默认值，完整选项说明见 README。
 
 server_addr = "127.0.0.1"
 server_port = 7000
 
 # 与服务端一致的全局 token
-token = "change-me-to-a-random-string"
-
-# ---------------------------------------------------------------- 连接与重连
-
-# 心跳间隔（秒）。服务端 heartbeat_timeout 通常是它的 3 倍。
-# 调小可以更快发现断线，代价是心跳包更频繁。
-heartbeat_interval = 30
-
-# 断线重连：从 reconnect_initial_delay 开始按指数增长，封顶 reconnect_max_delay，
-# 并带 ±20% 随机抖动（避免多个客户端同时重连打爆服务端）。
-reconnect_initial_delay = 1
-reconnect_max_delay = 30
-
-# 连接服务端 / 访问本地服务的超时（秒）
-dial_server_timeout = 10
-dial_local_timeout = 10
-
-# TCP keepalive 探测间隔（秒）。0 = 用系统默认。
-tcp_keepalive = 60
-
-# ---------------------------------------------------------------- 日志
-
-# trace / debug / info / warn / error（RUST_LOG 优先）
-log_level = "info"
-
-# ================================================================
-# 代理：一个 [[proxies]] = 服务端上的一个端口
-# ================================================================
+token = "change-me"
 
 [[proxies]]
-# 代理名，全局唯一。同名客户端重连会接管原有端口，不会冲突。
 name = "ssh"
-# 服务端对外暴露的端口：访问 <server_addr>:6000 等于访问本机 22 端口
+# 访问 <server_addr>:6000 等于访问本机 22 端口
 remote_port = 6000
 local_addr = "127.0.0.1"
 local_port = 22
 
-# 连接池：预先建立并保持 2 条空闲工作连接。
-# 有访问进来时服务端直接复用，省掉一次「控制往返 + TCP 握手」，
-# SSH 这类交互式场景的首字节延迟会明显降低。
-# 不需要就设为 0（或不写）。
-pool_count = 2
-
-
 [[proxies]]
 name = "web"
+# 连接池：预先建立空闲连接，访问时直接复用（默认 0 = 不用）
 remote_port = 8080
-local_addr = "127.0.0.1"
 local_port = 80
+pool_count = 2
 
-# 健康检查：周期性探测本地服务是否可连接。
-# 本地服务挂了 -> 通知服务端注销该代理、释放远端端口（让端口能被别的程序用）；
-# 本地服务恢复 -> 自动重新注册，端口自动恢复。
-# 不写 health_check_type（或写 "none"）表示不检查。
-health_check_type = "tcp"
-health_check_interval_seconds = 10
-health_check_timeout_seconds = 3
-# 连续失败多少次判定为不健康
-health_check_max_failed = 1
-pool_count = 1
+# 健康检查：本地服务挂了就释放远端端口，恢复后自动重新注册（默认关闭）
+# health_check_type = "tcp"
+# health_check_interval_seconds = 10
+# health_check_timeout_seconds = 3
+# health_check_max_failed = 1
 
-[[proxies]]
-name = "web-with-real-ip"
-remote_port = 8090
-local_addr = "127.0.0.1"
-local_port = 8443
-
-# PROXY protocol：把访客的真实 IP / 端口透传给本地服务。
-# 不启用时留空（或写 "none"）。
-#
-# 开启后，服务端会在正式数据之前附上一个头部，形如：
-#   PROXY TCP4 203.0.113.7 198.51.100.1 54321 8090
-# 客户端只是透明转发，本地服务读到它就知道了访客是谁。
-#
-# ⚠️ 本地服务必须支持解析这个头部（nginx / HAProxy / 多数常见服务都支持），
-#    否则会把头部当成正常数据，导致协议错乱。
-#    v1 = 文本格式（可读，便于调试）；v2 = 二进制格式（效率更高）。
-proxy_protocol_version = "v1"
+# 透传访客真实 IP，本地服务需支持 PROXY protocol（默认关闭）
+# proxy_protocol_version = "v1"
