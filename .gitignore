@@ -1,3 +1,6 @@
 /target
 **/*.rs.bk
 *.log
+
+# 本地打包验证产物（scripts/package.sh 的输出目录）
+dist/

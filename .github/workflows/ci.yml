@@ -77,25 +77,15 @@ jobs:
           rustup default stable
           rustup target add ${{ matrix.target }}
 
-      # ring 等含 C 代码的依赖需要对应目标的 C 工具链。
-      # gnu 目标用系统的 gcc 即可；musl 目标需要 musl-gcc/musl 交叉编译器。
-      - name: 安装 C 工具链
+      # ring（TLS 的加密后端）含 C 代码，构建时需要对应目标的 C 工具链。
+      # runner 自带 glibc 的 gcc，所以 gnu 目标无需额外安装；
+      # musl 目标不能用 glibc 的 gcc，需要 musl-gcc。
+      # 交叉目标由 cross 的容器提供工具链，本机不用装。
+      - name: 安装 C 工具链（musl 原生构建）
+        if: matrix.native && contains(matrix.target, 'musl')
         run: |
-          set -euo pipefail
           sudo apt-get update
-          case "${{ matrix.target }}" in
-            *musl*)
-              if [ "${{ matrix.native }}" = "true" ]; then
-                sudo apt-get install -y musl-tools
-              else
-                # 交叉编译 musl：cross 的容器里已备好工具链，这里只需本机 gcc
-                sudo apt-get install -y gcc-aarch64-linux-gnu gcc-arm-linux-gnueabihf
-              fi
-              ;;
-            *)
-              sudo apt-get install -y gcc
-              ;;
-          esac
+          sudo apt-get install -y musl-tools
 
       - uses: Swatinem/rust-cache@v2.9.2
         with:
