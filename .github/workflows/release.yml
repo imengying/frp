@@ -200,6 +200,26 @@ jobs:
             exit 1
           fi
 
+      # 先删掉该 release 上已有的 asset。
+      # action-gh-release 只覆盖同名文件，不会清理多余文件，
+      # 重发同一个版本时旧的产物（比如被移除的 SHA256SUMS.txt）会残留下来。
+      - name: 清理该 release 上的旧产物
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # release 不存在时会返回 404，属于正常情况（首次发布）
+          assets=$(gh release view "${GITHUB_REF_NAME}" --json assets --jq '.assets[].name' 2>/dev/null || true)
+          if [[ -z "$assets" ]]; then
+            echo "该 release 暂无产物（或 release 尚不存在），无需清理"
+            exit 0
+          fi
+          echo "$assets" | while read -r name; do
+            [[ -z "$name" ]] && continue
+            echo "删除旧产物: $name"
+            gh release delete-asset "${GITHUB_REF_NAME}" "$name" --yes
+          done
+
       - name: 创建 release
         uses: softprops/action-gh-release@v2
         with:
