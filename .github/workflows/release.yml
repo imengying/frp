@@ -1,0 +1,312 @@
+name: Release
+
+# 打 tag 时自动构建并发布。frps 与 frpc **分开打包、分开发布**，
+# 这样部署服务端的人不必下载客户端的二进制，反之亦然。
+#
+# 由于 GitHub 上「一个 tag 只能对应一个 release」，两个包用不同的 tag 前缀：
+#
+#   frps-v0.1.0  ->  发布 frps-v0.1.0   （只含 frps 各平台包）
+#   frpc-v0.1.0  ->  发布 frpc-v0.1.0   （只含 frpc 各平台包）
+#
+# 两个版本号建议保持一致，方便对应。
+#
+# 也可在 Actions 页面手动触发：只构建并上传 artifact，不创建 release。
+
+on:
+  push:
+    tags:
+      - "frps-v*"
+      - "frpc-v*"
+  workflow_dispatch:
+    inputs:
+      component:
+        description: "只构建哪一个（frps / frpc / both）"
+        required: true
+        default: both
+        type: choice
+        options: [both, frps, frpc]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ------------------------------------------------------------------
+  # 解析这次要构建/发布哪个组件、版本号是多少
+  # ------------------------------------------------------------------
+  prepare:
+    name: 解析目标
+    runs-on: ubuntu-latest
+    outputs:
+      frps: ${{ steps.parse.outputs.frps }}
+      frpc: ${{ steps.parse.outputs.frpc }}
+      version: ${{ steps.parse.outputs.version }}
+      tag: ${{ steps.parse.outputs.tag }}
+      is_tag: ${{ steps.parse.outputs.is_tag }}
+    steps:
+      - name: 解析 tag 前缀
+        id: parse
+        run: |
+          set -euo pipefail
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            WANT="${{ github.event.inputs.component }}"
+            echo "frps=$([[ $WANT == frps || $WANT == both ]] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+            echo "frpc=$([[ $WANT == frpc || $WANT == both ]] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+            echo "version=dev" >> "$GITHUB_OUTPUT"
+            echo "tag=" >> "$GITHUB_OUTPUT"
+            echo "is_tag=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          TAG="${{ github.ref_name }}"
+          case "$TAG" in
+            frps-v*)
+              VERSION="${TAG#frps-}"
+              echo "frps=true"  >> "$GITHUB_OUTPUT"
+              echo "frpc=false" >> "$GITHUB_OUTPUT"
+              ;;
+            frpc-v*)
+              VERSION="${TAG#frpc-}"
+              echo "frps=false" >> "$GITHUB_OUTPUT"
+              echo "frpc=true"  >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "无法识别的 tag: $TAG" >&2
+              exit 1
+              ;;
+          esac
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "is_tag=true" >> "$GITHUB_OUTPUT"
+          echo "将构建 $TAG（版本 $VERSION）"
+
+  # ------------------------------------------------------------------
+  # 构建矩阵：每个平台产出自己那份二进制
+  # ------------------------------------------------------------------
+  build:
+    name: 构建 ${{ matrix.target }}
+    needs: prepare
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # ---- Linux x86_64 ----
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu }
+          # musl 静态链接：任何发行版通用，也是 Alpine + OpenRC 的主流选择
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-musl }
+          # ---- Linux aarch64 ----
+          - { os: ubuntu-latest, target: aarch64-unknown-linux-gnu, cross: true }
+          - { os: ubuntu-latest, target: aarch64-unknown-linux-musl, cross: true }
+          # ---- Linux armv7 ----
+          - { os: ubuntu-latest, target: armv7-unknown-linux-musleabihf, cross: true }
+          # ---- macOS ----
+          - { os: macos-latest, target: x86_64-apple-darwin }
+          - { os: macos-latest, target: aarch64-apple-darwin }
+          # ---- Windows ----
+          - { os: windows-latest, target: x86_64-pc-windows-msvc, zip: true }
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装工具链
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup target add ${{ matrix.target }}
+        shell: bash
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      # 交叉编译用 cross，自带各平台链接器，省去手工配置
+      - name: 安装 cross
+        if: matrix.cross
+        run: cargo install cross --locked
+        shell: bash
+
+      - name: 构建（原生）
+        if: ${{ !matrix.cross }}
+        run: cargo build --release --locked --target ${{ matrix.target }}
+        shell: bash
+
+      - name: 构建（交叉）
+        if: matrix.cross
+        run: cross build --release --locked --target ${{ matrix.target }}
+        shell: bash
+
+      # 每个平台只打包本次需要的那个组件
+      # 打包逻辑放在 scripts/package.sh，与 CI 的冒烟测试共用同一份，
+      # 避免两边行为不一致（发布流程只在打 tag 时才跑，出问题代价高）
+      - name: 打包
+        shell: bash
+        env:
+          NEED_FRPS: ${{ needs.prepare.outputs.frps }}
+          NEED_FRPC: ${{ needs.prepare.outputs.frpc }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          chmod +x scripts/package.sh
+
+          if [[ "$NEED_FRPS" == "true" ]]; then
+            ./scripts/package.sh frps "$VERSION" "${{ matrix.target }}" dist
+          fi
+          if [[ "$NEED_FRPC" == "true" ]]; then
+            ./scripts/package.sh frpc "$VERSION" "${{ matrix.target }}" dist
+          fi
+
+          echo "打包结果："
+          ls -la dist
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          # 只上传压缩包：解包目录一起上传会让下游整理产物时报错
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+          if-no-files-found: error
+          compression-level: 0
+
+  # ------------------------------------------------------------------
+  # 发布：只发布本次 tag 对应的那个组件
+  # ------------------------------------------------------------------
+  release:
+    name: 发布
+    needs: [prepare, build]
+    if: needs.prepare.outputs.is_tag == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 下载全部产物
+        uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+          path: assets
+
+      - name: 整理产物
+        env:
+          NEED_FRPS: ${{ needs.prepare.outputs.frps }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          ls -la assets
+          # 只保留本次发布的组件
+          if [[ "$NEED_FRPS" == "true" ]]; then
+            find assets -type f ! -name 'frps_*' -delete
+          else
+            find assets -type f ! -name 'frpc_*' -delete
+          fi
+          echo "待发布文件："
+          ls -la assets
+          (cd assets && sha256sum * > SHA256SUMS.txt)
+          cat assets/SHA256SUMS.txt
+
+      - name: 创建 release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.prepare.outputs.tag }}
+          name: ${{ needs.prepare.outputs.frps == 'true' && 'frps' || 'frpc' }} ${{ needs.prepare.outputs.version }}
+          files: assets/*
+          body: |
+            ${{ needs.prepare.outputs.frps == 'true' && '内网穿透**服务端**（TCP 版）。' || '内网穿透**客户端**（TCP 版）。' }}
+
+            本 release 只包含 ${{ needs.prepare.outputs.frps == 'true' && 'frps' || 'frpc' }}，
+            另一个组件请到同名版本号、不同前缀的 release 下载
+            （服务端 tag 为 `frps-v*`，客户端 tag 为 `frpc-v*`）。
+
+            ## 安装
+
+            ```bash
+            # Linux x86_64 静态链接版（推荐，任何发行版通用）
+            tar xzf ${{ needs.prepare.outputs.frps == 'true' && 'frps' || 'frpc' }}_${{ needs.prepare.outputs.version }}_x86_64-unknown-linux-musl.tar.gz
+            cd ${{ needs.prepare.outputs.frps == 'true' && 'frps' || 'frpc' }}_${{ needs.prepare.outputs.version }}_x86_64-unknown-linux-musl
+            sudo install -m755 ${{ needs.prepare.outputs.frps == 'true' && 'frps' || 'frpc' }} /usr/local/bin/
+            sudo install -d /etc/frp
+            sudo install -m644 ${{ needs.prepare.outputs.frps == 'true' && 'frps' || 'frpc' }}.toml.example /etc/frp/${{ needs.prepare.outputs.frps == 'true' && 'frps' || 'frpc' }}.toml
+            # 改 token（服务端与客户端必须一致），客户端还要改 server_addr
+            sudo vi /etc/frp/${{ needs.prepare.outputs.frps == 'true' && 'frps' || 'frpc' }}.toml
+            # 部署前可先校验配置
+            /usr/local/bin/${{ needs.prepare.outputs.frps == 'true' && 'frps' || 'frpc' }} -c /etc/frp/${{ needs.prepare.outputs.frps == 'true' && 'frps' || 'frpc' }}.toml --check
+            ```
+
+            ## systemd
+
+            自己写一个 `/etc/systemd/system/${{ needs.prepare.outputs.frps == 'true' && 'frps' || 'frpc' }}.service`：
+
+            ```ini
+            [Unit]
+            Description=frp ${{ needs.prepare.outputs.frps == 'true' && 'server (frps)' || 'client (frpc)' }}
+            After=network-online.target
+            Wants=network-online.target
+
+            [Service]
+            Type=simple
+            ExecStart=/usr/local/bin/${{ needs.prepare.outputs.frps == 'true' && 'frps' || 'frpc' }} -c /etc/frp/${{ needs.prepare.outputs.frps == 'true' && 'frps' || 'frpc' }}.toml
+            Restart=always
+            RestartSec=3
+            LimitNOFILE=1048576
+            # 收到 SIGTERM 后释放端口、断开连接再退出
+            KillSignal=SIGTERM
+            TimeoutStopSec=10
+
+            [Install]
+            WantedBy=multi-user.target
+            ```
+
+            ```bash
+            sudo systemctl daemon-reload
+            sudo systemctl enable --now ${{ needs.prepare.outputs.frps == 'true' && 'frps' || 'frpc' }}
+            journalctl -u ${{ needs.prepare.outputs.frps == 'true' && 'frps' || 'frpc' }} -f
+            ```
+
+            ## OpenRC (Alpine)
+
+            `/etc/init.d/${{ needs.prepare.outputs.frps == 'true' && 'frps' || 'frpc' }}`：
+
+            ```sh
+            #!/sbin/openrc-run
+            name="${{ needs.prepare.outputs.frps == 'true' && 'frps' || 'frpc' }}"
+            command="/usr/local/bin/${{ needs.prepare.outputs.frps == 'true' && 'frps' || 'frpc' }}"
+            command_args="-c /etc/frp/${{ needs.prepare.outputs.frps == 'true' && 'frps' || 'frpc' }}.toml"
+            supervisor="supervise-daemon"
+            respawn_delay=3
+            output_log="/var/log/${{ needs.prepare.outputs.frps == 'true' && 'frps' || 'frpc' }}.log"
+            error_log="/var/log/${{ needs.prepare.outputs.frps == 'true' && 'frps' || 'frpc' }}.log"
+            depend() { need net; use dns logger; }
+            ```
+
+            ```bash
+            sudo chmod +x /etc/init.d/${{ needs.prepare.outputs.frps == 'true' && 'frps' || 'frpc' }}
+            sudo rc-update add ${{ needs.prepare.outputs.frps == 'true' && 'frps' || 'frpc' }} default
+            sudo rc-service ${{ needs.prepare.outputs.frps == 'true' && 'frps' || 'frpc' }} start
+            tail -f /var/log/${{ needs.prepare.outputs.frps == 'true' && 'frps' || 'frpc' }}.log
+            ```
+
+            停止服务发的是 SIGTERM，程序会先释放端口、断开连接再退出，
+            所以重启不会遇到「端口被占用」。
+
+            ## 校验
+
+            ```bash
+            sha256sum -c SHA256SUMS.txt
+            ```
+
+            ## 支持平台
+
+            | 平台 | 说明 |
+            | --- | --- |
+            | x86_64-unknown-linux-gnu | 常见 x86_64 Linux |
+            | x86_64-unknown-linux-musl | 静态链接，任意发行版 / Alpine |
+            | aarch64-unknown-linux-gnu | ARM64 Linux |
+            | aarch64-unknown-linux-musl | ARM64 Linux（静态） |
+            | armv7-unknown-linux-musleabihf | 32 位 ARM（树莓派等） |
+            | x86_64-apple-darwin | Intel Mac |
+            | aarch64-apple-darwin | Apple Silicon Mac |
+            | x86_64-pc-windows-msvc | Windows |
+          draft: false
+          prerelease: false

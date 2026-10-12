@@ -1,0 +1,33 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/frp-core",
+    "crates/frp-server",
+    "crates/frp-client",
+    "crates/frp-tests",
+]
+
+[workspace.package]
+version = "1.0.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+description = "A simple TCP-only reverse proxy (frp) written in Rust"
+
+[workspace.dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "time", "local-time"] }
+clap = { version = "4", features = ["derive"] }
+
+frp-core = { path = "crates/frp-core" }
+frp-server = { path = "crates/frp-server" }
+frp-client = { path = "crates/frp-client" }
+
+[profile.release]
+lto = "thin"
+strip = true

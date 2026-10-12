@@ -1,0 +1,120 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  lint:
+    name: 格式与静态检查
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装工具链
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt,clippy
+          rustup default stable
+          rustc --version
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo fmt
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets
+
+  test:
+    name: 测试 (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装工具链
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: 运行测试
+        run: cargo test --workspace
+
+  # 用与 release 完全相同的脚本打一次包，确保发布流程不会在打 tag 那天才炸。
+  # 这里能拦住的问题：包里少了二进制/配置示例、两个组件混进对方的东西、
+  # 打包脚本语法错误、解包目录残留等。
+  package:
+    name: 打包冒烟测试
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装工具链
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: 构建
+        run: cargo build --release --locked --target x86_64-unknown-linux-gnu
+
+      - name: 打包两个组件
+        run: |
+          set -euo pipefail
+          chmod +x scripts/package.sh
+          ./scripts/package.sh frps v0.0.0-ci x86_64-unknown-linux-gnu dist
+          ./scripts/package.sh frpc v0.0.0-ci x86_64-unknown-linux-gnu dist
+
+      - name: 校验包内容
+        run: |
+          set -euo pipefail
+          echo "== dist 内容 =="
+          ls -la dist
+
+          # 除了两个压缩包之外不能有别的文件（解包目录残留会让发布步骤失败）
+          count=$(find dist -mindepth 1 -maxdepth 1 -type f | wc -l)
+          [ "$count" -eq 2 ] || { echo "dist 下应为 2 个压缩包，实际 $count"; exit 1; }
+
+          frps_pkg="dist/frps_v0.0.0-ci_x86_64-unknown-linux-gnu.tar.gz"
+          frpc_pkg="dist/frpc_v0.0.0-ci_x86_64-unknown-linux-gnu.tar.gz"
+          [ -f "$frps_pkg" ] || { echo "缺少 $frps_pkg"; exit 1; }
+          [ -f "$frpc_pkg" ] || { echo "缺少 $frpc_pkg"; exit 1; }
+
+          check() {
+            local pkg="$1" comp="$2"
+            echo "== $pkg =="
+
+            # 先把清单读进变量再用 grep 判断。
+            # 别写成 `tar tzf ... | grep -q`：grep -q 命中后会立刻退出，
+            # tar 因此收到 SIGPIPE 返回非 0，在 pipefail 下整条管道算失败，
+            # 判断就永远不成立，这个校验会静默失效。
+            local listing other
+            listing=$(tar tzf "$pkg")
+            echo "$listing"
+
+            echo "$listing" | grep -q "/${comp}$" || { echo "缺少 $comp 二进制"; exit 1; }
+            echo "$listing" | grep -q "/${comp}.toml.example" || { echo "缺少配置示例"; exit 1; }
+            echo "$listing" | grep -q "/README.md" || { echo "缺少 README"; exit 1; }
+
+            # 不能混进另一个组件的二进制
+            other=frps; [ "$comp" = frps ] && other=frpc
+            if echo "$listing" | grep -q "/${other}$"; then
+              echo "$pkg 里混进了 $other"; exit 1
+            fi
+          }
+          check "$frps_pkg" frps
+          check "$frpc_pkg" frpc
+
+          echo "打包冒烟测试通过"

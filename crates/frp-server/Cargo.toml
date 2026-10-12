@@ -1,0 +1,22 @@
+[package]
+name = "frp-server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "frps: frp 服务端"
+
+[lib]
+name = "frp_server"
+path = "src/lib.rs"
+
+[[bin]]
+name = "frps"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+frp-core.workspace = true

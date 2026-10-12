@@ -1,0 +1,19 @@
+[package]
+name = "frp-tests"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = "frp 端到端集成测试"
+
+[dependencies]
+
+[dev-dependencies]
+anyhow.workspace = true
+toml.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+frp-core.workspace = true
+frp-server.workspace = true
+frp-client.workspace = true

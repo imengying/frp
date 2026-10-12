@@ -1,0 +1,22 @@
+[package]
+name = "frp-client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "frpc: frp 客户端"
+
+[lib]
+name = "frp_client"
+path = "src/lib.rs"
+
+[[bin]]
+name = "frpc"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+frp-core.workspace = true
