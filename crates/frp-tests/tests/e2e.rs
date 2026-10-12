@@ -57,17 +57,17 @@ async fn start_echo_server() -> (String, u16) {
 
 /// 启动 frps（控制端口由系统分配），返回（控制地址, 任务句柄）。
 /// `abort()` 该句柄即可模拟服务端下线。
-async fn start_server(allow_ports: &str) -> (SocketAddr, JoinHandle<()>) {
+async fn start_server(allow_ports: AllowPorts) -> (SocketAddr, JoinHandle<()>) {
     start_server_on(0, allow_ports).await
 }
 
 /// 在指定控制端口启动 frps（端口为 0 时由系统分配）。
-async fn start_server_on(bind_port: u16, allow_ports: &str) -> (SocketAddr, JoinHandle<()>) {
+async fn start_server_on(bind_port: u16, allow_ports: AllowPorts) -> (SocketAddr, JoinHandle<()>) {
     let cfg = ServerConfig {
         bind_addr: "127.0.0.1".into(),
         bind_port,
         token: TEST_TOKEN.into(),
-        allow_ports: AllowPorts::parse(allow_ports).unwrap(),
+        allow_ports,
         transport: ServerTransport {
             heartbeat_timeout: 5,
             work_conn_timeout: 3,
@@ -153,7 +153,7 @@ async fn round_trip(port: u16, payload: &[u8]) -> Vec<u8> {
 async fn forwards_traffic_and_propagates_half_close() {
     let (host, local_port) = start_echo_server().await;
     let remote_port = reserve_port();
-    let (server, _guard) = start_server("").await;
+    let (server, _guard) = start_server(AllowPorts::default()).await;
     let _client = start_client(
         ClientSpec {
             server,
@@ -187,7 +187,7 @@ async fn forwards_traffic_and_propagates_half_close() {
 async fn handles_concurrent_connections() {
     let (host, local_port) = start_echo_server().await;
     let remote_port = reserve_port();
-    let (server, _guard) = start_server("").await;
+    let (server, _guard) = start_server(AllowPorts::default()).await;
     let _client = start_client(
         ClientSpec {
             server,
@@ -218,7 +218,7 @@ async fn handles_concurrent_connections() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn rejects_wrong_token() {
-    let (server, _guard) = start_server("").await;
+    let (server, _guard) = start_server(AllowPorts::default()).await;
 
     let mut conn = TcpStream::connect(server).await.unwrap();
     write_msg(
@@ -248,7 +248,7 @@ async fn rejects_wrong_token() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn rejects_version_mismatch() {
-    let (server, _guard) = start_server("").await;
+    let (server, _guard) = start_server(AllowPorts::default()).await;
 
     let mut conn = TcpStream::connect(server).await.unwrap();
     write_msg(
@@ -279,7 +279,7 @@ async fn rejects_version_mismatch() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn reports_port_outside_allow_list() {
     // 服务端只允许 6000，客户端申请其它端口
-    let (server, _guard) = start_server("6000").await;
+    let (server, _guard) = start_server(AllowPorts::single(6000)).await;
     let denied_port = reserve_port();
 
     let mut conn = TcpStream::connect(server).await.unwrap();
@@ -322,7 +322,7 @@ async fn reports_port_outside_allow_list() {
 async fn heartbeat_keeps_connection_alive() {
     let (host, local_port) = start_echo_server().await;
     let remote_port = reserve_port();
-    let (server, _guard) = start_server("").await;
+    let (server, _guard) = start_server(AllowPorts::default()).await;
     let _client = start_client(
         ClientSpec {
             server,
@@ -348,7 +348,7 @@ async fn heartbeat_keeps_connection_alive() {
 async fn client_reconnects_after_server_restart() {
     let (host, local_port) = start_echo_server().await;
     let remote_port = reserve_port();
-    let (server, guard) = start_server("").await;
+    let (server, guard) = start_server(AllowPorts::default()).await;
     let control_port = server.port();
 
     let _client = start_client(
@@ -375,7 +375,7 @@ async fn client_reconnects_after_server_restart() {
     );
 
     // 在同一控制端口重启服务端，客户端应自动重连并重新注册代理
-    let (_server, _guard) = start_server_on(control_port, "").await;
+    let (_server, _guard) = start_server_on(control_port, AllowPorts::default()).await;
     wait_remote_ready(remote_port).await;
     assert_eq!(
         round_trip(remote_port, b"after-restart").await,
@@ -387,7 +387,7 @@ async fn client_reconnects_after_server_restart() {
 async fn takeover_replaces_old_client_with_same_proxy_name() {
     let (host, local_port) = start_echo_server().await;
     let remote_port = reserve_port();
-    let (server, _guard) = start_server("").await;
+    let (server, _guard) = start_server(AllowPorts::default()).await;
 
     let spec = || ClientSpec {
         server,
@@ -417,7 +417,7 @@ async fn takeover_replaces_old_client_with_same_proxy_name() {
 async fn pool_count_serves_traffic_and_refills() {
     let (host, local_port) = start_echo_server().await;
     let remote_port = reserve_port();
-    let (server, _guard) = start_server("").await;
+    let (server, _guard) = start_server(AllowPorts::default()).await;
 
     let mut cfg = ClientSpec {
         server,
@@ -481,7 +481,7 @@ async fn health_check_unregisters_and_restores_proxy() {
     });
 
     let remote_port = reserve_port();
-    let (server, _guard) = start_server("").await;
+    let (server, _guard) = start_server(AllowPorts::default()).await;
     let cfg = ClientConfig {
         proxies: vec![ProxyConfig {
             name: "echo".into(),
@@ -558,7 +558,7 @@ async fn health_check_unregisters_and_restores_proxy() {
 async fn server_shutdown_releases_proxy_ports() {
     let (host, local_port) = start_echo_server().await;
     let remote_port = reserve_port();
-    let (server, guard) = start_server("").await;
+    let (server, guard) = start_server(AllowPorts::default()).await;
 
     let _client = start_client(
         ClientSpec {
@@ -672,7 +672,7 @@ async fn start_proxy_protocol_echo() -> (String, u16, tokio::sync::mpsc::Receive
 async fn proxy_protocol_passes_visitor_address() {
     let (host, local_port, mut header_rx) = start_proxy_protocol_echo().await;
     let remote_port = reserve_port();
-    let (server, _guard) = start_server("").await;
+    let (server, _guard) = start_server(AllowPorts::default()).await;
 
     let mut cfg = ClientSpec {
         server,
@@ -743,7 +743,7 @@ async fn proxy_protocol_disabled_by_default() {
     // 不能凭空多出 "PROXY " 前缀（否则会把普通服务打挂）
     let (host, local_port) = start_echo_server().await;
     let remote_port = reserve_port();
-    let (server, _guard) = start_server("").await;
+    let (server, _guard) = start_server(AllowPorts::default()).await;
     let _client = start_client(
         ClientSpec {
             server,
@@ -769,12 +769,12 @@ async fn rejects_invalid_proxy_protocol_version() {
         token = "t"
         [[proxies]]
         name = "bad"
-        remote_port = 6000
-        local_port = 22
-        proxy_protocol_version = "v3"
+        remotePort = 6000
+        localPort = 22
+        proxyProtocolVersion = "v3"
         "#,
     )
     .unwrap();
     let err = cfg.validate().unwrap_err().to_string();
-    assert!(err.contains("proxy_protocol_version"), "{err}");
+    assert!(err.contains("proxyProtocolVersion"), "{err}");
 }

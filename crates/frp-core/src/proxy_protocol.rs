@@ -40,7 +40,7 @@ impl ProxyProtocol {
             "v1" | "1" => Ok(ProxyProtocol::V1),
             "v2" | "2" => Ok(ProxyProtocol::V2),
             other => {
-                bail!("不支持的 proxy_protocol_version `{other}`（可选：v1 / v2，留空表示不启用）")
+                bail!("不支持的 proxyProtocolVersion `{other}`（可选：v1 / v2，留空表示不启用）")
             }
         }
     }
