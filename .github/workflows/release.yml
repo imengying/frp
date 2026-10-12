@@ -190,16 +190,23 @@ jobs:
           (cd assets && sha256sum * > SHA256SUMS.txt)
           cat assets/SHA256SUMS.txt
 
-      # release 必须落在真实存在的 tag 上
+      # 校验 release 会落在哪个 tag 上。
+      # 不用 `git fetch --depth=1`：浅克隆下取 tag 容易失败，
+      # 真正创建 release 的是下面那一步，这里只做记录与断言。
       - name: 确认 tag
         run: |
           set -euo pipefail
-          git fetch --tags --depth=1 origin
-          if ! git rev-parse "refs/tags/${GITHUB_REF_NAME}" >/dev/null 2>&1; then
-            echo "::error::tag ${GITHUB_REF_NAME} 不存在"
+          echo "触发本次运行的 ref: ${GITHUB_REF}"
+          echo "tag 名: ${GITHUB_REF_NAME}"
+          case "${GITHUB_REF}" in
+            refs/tags/*) echo "✅ 本次运行由 tag 触发，release 将创建在该 tag 上" ;;
+            *) echo "::error::本次运行不是由 tag 触发（${GITHUB_REF}）"; exit 1 ;;
+          esac
+          # tag 名形如 v1.0.0，解析出的版本号必须与之吻合
+          if [[ "v${{ needs.prepare.outputs.number }}" != "${GITHUB_REF_NAME}" ]]; then
+            echo "::error::解析出的版本与 tag 不一致"
             exit 1
           fi
-          echo "tag ${GITHUB_REF_NAME} -> $(git rev-parse "refs/tags/${GITHUB_REF_NAME}")"
 
       - name: 创建 release
         uses: softprops/action-gh-release@v2
