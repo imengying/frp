@@ -140,7 +140,7 @@ mod tests {
             proxies: vec![ProxyConfig {
                 name: "ssh".into(),
                 remote_port: 6000,
-                local_addr: "127.0.0.1".into(),
+                local_ip: "127.0.0.1".into(),
                 local_port: 22,
                 ..Default::default()
             }],

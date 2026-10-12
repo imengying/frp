@@ -1,30 +1,37 @@
-# frpc 配置示例。未写的项都用默认值，完整选项说明见 README。
+# frpc 配置示例。字段名与官方 frp 一致，未写的项都用默认值。
+# 完整选项说明见 README。
 
-server_addr = "127.0.0.1"
-server_port = 7000
-
-# 与服务端一致的全局 token
+serverAddr = "127.0.0.1"
+serverPort = 7000
 token = "change-me"
 
 [[proxies]]
-name = "ssh"
-# 访问 <server_addr>:6000 等于访问本机 22 端口
-remote_port = 6000
-local_addr = "127.0.0.1"
-local_port = 22
+name = "test-tcp"
+type = "tcp"
+localIP = "127.0.0.1"
+localPort = 22
+remotePort = 6000
 
-[[proxies]]
-name = "web"
+# 其它可选配置（取消注释即可启用）：
+#
 # 连接池：预先建立空闲连接，访问时直接复用（默认 0 = 不用）
-remote_port = 8080
-local_port = 80
-pool_count = 2
-
+# poolCount = 2
+#
 # 健康检查：本地服务挂了就释放远端端口，恢复后自动重新注册（默认关闭）
-# health_check_type = "tcp"
-# health_check_interval_seconds = 10
-# health_check_timeout_seconds = 3
-# health_check_max_failed = 1
-
+# [proxies.healthCheck]
+# type = "tcp"
+# intervalSeconds = 10
+# timeoutSeconds = 3
+# maxFailed = 1
+#
 # 透传访客真实 IP，本地服务需支持 PROXY protocol（默认关闭）
-# proxy_protocol_version = "v1"
+# proxyProtocolVersion = "v1"
+#
+# [transport]
+# heartbeatInterval = 30
+# dialServerTimeout = 10
+# dialLocalTimeout = 10
+# tcpKeepalive = 60
+#
+# [log]
+# level = "info"

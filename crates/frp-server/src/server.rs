@@ -36,8 +36,6 @@ use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::timeout;
 use tracing::{debug, info, warn};
 
-use crate::ports::PortAllowList;
-
 /// 等待连接发送首条消息（登录 / 工作连接握手）的超时。
 const FIRST_MSG_TIMEOUT: Duration = Duration::from_secs(10);
 /// 每个控制连接的消息队列长度。
@@ -88,11 +86,8 @@ impl Server {
     pub fn new(cfg: ServerConfig) -> Result<Self> {
         cfg.validate()?;
         let cfg = Arc::new(cfg);
-        // 提前解析端口白名单，配置写错时立刻报错。
-        let allow = PortAllowList::parse(&cfg.allow_ports).context("解析 allow_ports 失败")?;
         let shared = Arc::new(Shared {
             cfg: cfg.clone(),
-            allow,
             proxies: Mutex::new(HashMap::new()),
             pending: Mutex::new(HashMap::new()),
         });
@@ -151,7 +146,7 @@ impl Server {
                 _ = shutdown.changed() => break,
                 accepted = listener.accept() => match accepted {
                     Ok((stream, peer)) => {
-                        tune_stream(&stream, shared.cfg.tcp_keepalive);
+                        tune_stream(&stream, shared.cfg.transport.tcp_keepalive);
                         let shared = shared.clone();
                         conns.spawn(async move {
                             if let Err(err) = handle_conn(shared, stream, peer).await {
@@ -209,7 +204,6 @@ struct ProxyEntry {
 /// 服务端共享状态。
 struct Shared {
     cfg: Arc<ServerConfig>,
-    allow: PortAllowList,
     /// 代理名 -> 代理信息。
     proxies: Mutex<HashMap<String, ProxyEntry>>,
     /// nonce -> 等待中的工作连接。
@@ -412,11 +406,11 @@ impl Shared {
         check_quota: bool,
     ) -> Result<(String, bool)> {
         proxy.validate().context("代理配置非法")?;
-        if !self.allow.allows(proxy.remote_port) {
+        if !self.cfg.allow_ports.allows(proxy.remote_port) {
             bail!(
                 "远端端口 {} 不在服务端允许的范围内（{}）",
                 proxy.remote_port,
-                self.allow.describe()
+                self.cfg.allow_ports.describe()
             );
         }
 
@@ -604,12 +598,12 @@ async fn control_read_loop(
     run_id: &str,
     peer: SocketAddr,
 ) -> Result<()> {
-    let heartbeat_timeout = Duration::from_secs(shared.cfg.heartbeat_timeout);
+    let heartbeat_timeout = Duration::from_secs(shared.cfg.transport.heartbeat_timeout);
     loop {
         match timeout(heartbeat_timeout, read_msg(rd)).await {
             Err(_) => bail!(
                 "{peer} 超过 {}s 未发送心跳，判定为离线",
-                shared.cfg.heartbeat_timeout
+                shared.cfg.transport.heartbeat_timeout
             ),
             Ok(Ok(None)) => {
                 info!("客户端 {peer} 关闭了控制连接");
@@ -756,7 +750,7 @@ async fn handle_visitor(
     visitor: TcpStream,
     peer: SocketAddr,
 ) {
-    tune_stream(&visitor, shared.cfg.tcp_keepalive);
+    tune_stream(&visitor, shared.cfg.transport.tcp_keepalive);
     let Some((run_id, control_tx)) = shared.control_for(&proxy_name) else {
         info!("代理 `{proxy_name}` 当前无在线客户端，拒绝来自 {peer} 的访问");
         return;
@@ -803,7 +797,7 @@ async fn handle_visitor(
         return;
     }
 
-    let wait = Duration::from_secs(shared.cfg.work_conn_timeout);
+    let wait = Duration::from_secs(shared.cfg.transport.work_conn_timeout);
     match timeout(wait, work_rx).await {
         Ok(Ok(mut work)) => {
             // 在正式数据前附上访客真实地址（未启用时不写任何东西）

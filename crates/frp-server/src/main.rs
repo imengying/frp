@@ -13,7 +13,7 @@ use anyhow::Result;
 use clap::Parser;
 use frp_core::config::ServerConfig;
 use frp_core::{log, signal};
-use frp_server::{PortAllowList, Server};
+use frp_server::Server;
 
 /// frp 服务端（TCP 版）。
 #[derive(Debug, Parser)]
@@ -42,7 +42,7 @@ async fn main() -> ExitCode {
 
 async fn run(args: Args) -> Result<()> {
     let cfg = ServerConfig::load(&args.config)?;
-    log::init(&cfg.log_level);
+    log::init(&cfg.log.level);
 
     if args.check {
         tracing::info!("配置校验通过: {}", args.config.display());
@@ -51,11 +51,10 @@ async fn run(args: Args) -> Result<()> {
 
     let mut server = Server::new(cfg)?;
     let addr = server.bind().await?;
-    let allow = PortAllowList::parse(&server.config().allow_ports)?;
     tracing::info!(
         "frps 已启动: 控制端口 {addr}，代理端口绑定于 {}，允许端口 {}",
         server.config().proxy_bind_addr(),
-        allow.describe()
+        server.config().allow_ports.describe()
     );
 
     let handle = server.shutdown_handle();

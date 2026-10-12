@@ -1,6 +1,6 @@
 //! frps: frp 服务端。
 //!
-//! 服务端在同一个 `bind_port` 上同时接受两类连接：
+//! 服务端在同一个 `bindPort` 上同时接受两类连接：
 //! - **控制连接**：首条消息为 [`frp_core::protocol::Message::Login`]，保持长连接用于心跳与通知；
 //! - **工作连接**：首条消息为 [`frp_core::protocol::Message::NewWorkConn`]，由客户端按需
 //!   建立（或被连接池预先建立），用于承载真实流量。
@@ -18,8 +18,6 @@
 //! # }
 //! ```
 
-pub mod ports;
 pub mod server;
 
-pub use ports::PortAllowList;
 pub use server::{Server, ShutdownHandle};

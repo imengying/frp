@@ -5,7 +5,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use frp_core::config::{ClientConfig, ProxyConfig, ServerConfig};
+use frp_core::config::{
+    AllowPorts, ClientConfig, ClientTransport, HealthCheckConfig, ProxyConfig, ServerConfig,
+    ServerTransport,
+};
 use frp_core::ioframe::{read_msg, write_msg};
 use frp_core::protocol::{Message, PROTOCOL_VERSION};
 use frp_server::Server;
@@ -64,9 +67,12 @@ async fn start_server_on(bind_port: u16, allow_ports: &str) -> (SocketAddr, Join
         bind_addr: "127.0.0.1".into(),
         bind_port,
         token: TEST_TOKEN.into(),
-        allow_ports: allow_ports.into(),
-        heartbeat_timeout: 5,
-        work_conn_timeout: 3,
+        allow_ports: AllowPorts::parse(allow_ports).unwrap(),
+        transport: ServerTransport {
+            heartbeat_timeout: 5,
+            work_conn_timeout: 3,
+            ..Default::default()
+        },
         ..Default::default()
     };
     let mut server = Server::new(cfg).unwrap();
@@ -101,15 +107,17 @@ impl ClientSpec<'_> {
             server_port: self.server.port(),
             token: TEST_TOKEN.into(),
             // 缩短心跳与重连间隔，便于在测试中观察保活与自动重连
-            heartbeat_interval: 1,
+            transport: ClientTransport {
+                heartbeat_interval: 1,
+                dial_local_timeout: 3,
+                ..Default::default()
+            },
             reconnect_initial_delay: 1,
             reconnect_max_delay: 2,
-            dial_local_timeout: 3,
-            log_level: "info".into(),
             proxies: vec![ProxyConfig {
                 name: self.proxy_name.into(),
                 remote_port: self.remote_port,
-                local_addr: self.local_host.into(),
+                local_ip: self.local_host.into(),
                 local_port: self.local_port,
                 ..Default::default()
             }],
@@ -283,7 +291,7 @@ async fn reports_port_outside_allow_list() {
             proxies: vec![ProxyConfig {
                 name: "denied".into(),
                 remote_port: denied_port,
-                local_addr: "127.0.0.1".into(),
+                local_ip: "127.0.0.1".into(),
                 local_port: 1,
                 ..Default::default()
             }],
@@ -478,14 +486,15 @@ async fn health_check_unregisters_and_restores_proxy() {
         proxies: vec![ProxyConfig {
             name: "echo".into(),
             remote_port,
-            local_addr: local_addr.ip().to_string(),
+            local_ip: local_addr.ip().to_string(),
             local_port: local_addr.port(),
-            health_check_type: "tcp".into(),
-            health_check_interval_seconds: 1,
-            health_check_timeout_seconds: 1,
-            health_check_max_failed: 1,
-            pool_count: 0,
-            proxy_protocol_version: String::new(),
+            health_check: HealthCheckConfig {
+                check_type: "tcp".into(),
+                interval_seconds: 1,
+                timeout_seconds: 1,
+                max_failed: 1,
+            },
+            ..Default::default()
         }],
         ..ClientSpec {
             server,

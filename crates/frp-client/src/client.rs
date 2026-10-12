@@ -137,7 +137,7 @@ impl Client {
     /// 建立一次会话并维持长连接，返回会话结束的原因。
     async fn session(&self, backoff: &mut Backoff) -> SessionEnd {
         let server = self.server_addr();
-        let stream = match connect_tcp(&server, self.cfg.tcp_keepalive).await {
+        let stream = match connect_tcp(&server, self.cfg.transport.tcp_keepalive).await {
             Ok(stream) => stream,
             Err(err) => return SessionEnd::Disconnected(Some(err)),
         };
@@ -148,7 +148,7 @@ impl Client {
     /// 在一条已建立的控制连接上完成登录并维持长连接。
     async fn serve(&self, stream: TcpStream, backoff: &mut Backoff) -> SessionEnd {
         let (mut rd, mut wr) = stream.into_split();
-        let interval_secs = self.cfg.heartbeat_interval;
+        let interval_secs = self.cfg.transport.heartbeat_interval;
 
         // 一、登录
         let login = Message::Login {
@@ -240,7 +240,7 @@ impl Client {
 
     /// 心跳应答允许的最长等待时间。
     fn pong_timeout_secs(&self) -> u64 {
-        (self.cfg.heartbeat_interval * 3).max(MIN_PONG_TIMEOUT_SECS)
+        (self.cfg.transport.heartbeat_interval * 3).max(MIN_PONG_TIMEOUT_SECS)
     }
 
     /// 控制连接的读循环。
@@ -261,7 +261,7 @@ impl Client {
                             warn!("服务端请求为未知代理 `{proxy_name}` 建立工作连接，已忽略");
                             continue;
                         };
-                        let dial_timeout = Duration::from_secs(self.cfg.dial_local_timeout);
+                        let dial_timeout = Duration::from_secs(self.cfg.transport.dial_local_timeout);
                         let server = ctx.server.clone();
                         let run_id = ctx.run_id.clone();
                         tokio::spawn(async move {
@@ -550,7 +550,7 @@ async fn health_check_loop(cfg: Arc<ClientConfig>, out_tx: mpsc::Sender<Message>
     let checked: Vec<ProxyConfig> = cfg
         .proxies
         .iter()
-        .filter(|proxy| proxy.health_check_enabled())
+        .filter(|proxy| proxy.health_check.enabled())
         .cloned()
         .collect();
     if checked.is_empty() {
@@ -572,7 +572,7 @@ async fn health_check_loop(cfg: Arc<ClientConfig>, out_tx: mpsc::Sender<Message>
                 .entry(proxy.name.clone())
                 .or_insert(Duration::ZERO);
             *elapsed += Duration::from_secs(1);
-            if *elapsed < Duration::from_secs(proxy.health_check_interval_seconds) {
+            if *elapsed < Duration::from_secs(proxy.health_check.interval_seconds) {
                 continue;
             }
             *elapsed = Duration::ZERO;
@@ -601,9 +601,9 @@ async fn health_check_loop(cfg: Arc<ClientConfig>, out_tx: mpsc::Sender<Message>
                     proxy.name,
                     proxy.local_target(),
                     state.failed,
-                    proxy.health_check_max_failed
+                    proxy.health_check.max_failed
                 );
-                if state.failed >= proxy.health_check_max_failed {
+                if state.failed >= proxy.health_check.max_failed {
                     state.down = true;
                     warn!(
                         "代理 `{}` 判定为不健康，通知服务端注销并释放远端端口 {}",
@@ -636,7 +636,7 @@ struct HealthState {
 async fn check_local_tcp(proxy: &ProxyConfig) -> bool {
     let target = proxy.local_target();
     match timeout(
-        Duration::from_secs(proxy.health_check_timeout_seconds),
+        Duration::from_secs(proxy.health_check.timeout_seconds),
         TcpStream::connect(&target),
     )
     .await
@@ -700,6 +700,7 @@ impl Backoff {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use frp_core::config::{ClientTransport, HealthCheckConfig};
 
     fn cfg() -> ClientConfig {
         ClientConfig {
@@ -707,7 +708,7 @@ mod tests {
             proxies: vec![ProxyConfig {
                 name: "ssh".into(),
                 remote_port: 6000,
-                local_addr: "127.0.0.1".into(),
+                local_ip: "127.0.0.1".into(),
                 local_port: 22,
                 ..Default::default()
             }],
@@ -737,14 +738,20 @@ mod tests {
     #[test]
     fn pong_timeout_scales_with_heartbeat() {
         let short = Client::new(ClientConfig {
-            heartbeat_interval: 1,
+            transport: ClientTransport {
+                heartbeat_interval: 1,
+                ..Default::default()
+            },
             ..cfg()
         })
         .unwrap();
         assert_eq!(short.pong_timeout_secs(), MIN_PONG_TIMEOUT_SECS);
 
         let long = Client::new(ClientConfig {
-            heartbeat_interval: 30,
+            transport: ClientTransport {
+                heartbeat_interval: 30,
+                ..Default::default()
+            },
             ..cfg()
         })
         .unwrap();
@@ -791,9 +798,12 @@ mod tests {
         let reachable = ProxyConfig {
             name: "up".into(),
             remote_port: 6000,
-            local_addr: addr.ip().to_string(),
+            local_ip: addr.ip().to_string(),
             local_port: addr.port(),
-            health_check_type: "tcp".into(),
+            health_check: HealthCheckConfig {
+                check_type: "tcp".into(),
+                ..Default::default()
+            },
             ..Default::default()
         };
         assert!(check_local_tcp(&reachable).await);
@@ -805,10 +815,13 @@ mod tests {
         let unreachable = ProxyConfig {
             name: "down".into(),
             remote_port: 6001,
-            local_addr: dead_addr.ip().to_string(),
+            local_ip: dead_addr.ip().to_string(),
             local_port: dead_addr.port(),
-            health_check_type: "tcp".into(),
-            health_check_timeout_seconds: 1,
+            health_check: HealthCheckConfig {
+                check_type: "tcp".into(),
+                timeout_seconds: 1,
+                ..Default::default()
+            },
             ..Default::default()
         };
         assert!(!check_local_tcp(&unreachable).await);

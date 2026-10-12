@@ -42,7 +42,7 @@ async fn main() -> ExitCode {
 
 async fn run(args: Args) -> Result<()> {
     let cfg = ClientConfig::load(&args.config)?;
-    log::init(&cfg.log_level);
+    log::init(&cfg.log.level);
 
     if args.check {
         tracing::info!("配置校验通过: {}", args.config.display());
