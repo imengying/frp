@@ -43,12 +43,16 @@ echo "== $pkg =="
 listing=$(tar tzf "$pkg")
 echo "$listing"
 
-# 包里只有二进制与配套配置，且必须是平铺的（不能套一层目录），
+# 包里只有二进制与配置示例，且必须是平铺的（不能套一层目录），
 # 否则用户解压后还得再 cd 进去，也可能把上级目录搞乱。
+#
+# 配置示例必须带 .example 后缀：用户很可能就在解压目录里放着自己的
+# ${comp}.toml，包内若也叫这个名字，解压会直接把配置覆盖掉。
+#
 # 不能用 $'...' 拼期望值：那是 ANSI-C quoting，变量不会展开。
-expected=$(printf '%s\n%s.toml' "$comp" "$comp")
+expected=$(printf '%s\n%s.example.toml' "$comp" "$comp")
 if [ "$listing" != "$expected" ]; then
-	echo "$pkg 内容不合预期，应恰好是 ${comp} 与 ${comp}.toml 两个平铺文件"
+	echo "$pkg 内容不合预期，应恰好是 ${comp} 与 ${comp}.example.toml 两个平铺文件"
 	echo "实际："
 	printf '%s\n' "$listing"
 	exit 1
@@ -80,8 +84,8 @@ else
 	}
 fi
 
-"$checker_bin" -c "$work/${comp}.toml" --check >/dev/null || {
-	echo "包内 ${comp}.toml 无法通过配置校验"
+"$checker_bin" -c "$work/${comp}.example.toml" --check >/dev/null || {
+	echo "包内 ${comp}.example.toml 无法通过配置校验"
 	exit 1
 }
 

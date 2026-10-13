@@ -27,9 +27,9 @@ fn strip_hash(line: &str) -> &str {
 
 #[test]
 fn frps_example_is_valid() {
-    let text = example("frps.toml.example");
-    let cfg: ServerConfig = toml::from_str(&text).expect("frps.toml.example 解析失败");
-    cfg.validate().expect("frps.toml.example 校验失败");
+    let text = example("frps.example.toml");
+    let cfg: ServerConfig = toml::from_str(&text).expect("frps.example.toml 解析失败");
+    cfg.validate().expect("frps.example.toml 校验失败");
     assert_eq!(cfg.bind_port, 7000);
     assert!(cfg.allow_ports.allows(6005));
     assert!(cfg.allow_ports.allows(7000));
@@ -37,9 +37,9 @@ fn frps_example_is_valid() {
 
 #[test]
 fn frpc_example_is_valid() {
-    let text = example("frpc.toml.example");
-    let cfg: ClientConfig = toml::from_str(&text).expect("frpc.toml.example 解析失败");
-    cfg.validate().expect("frpc.toml.example 校验失败");
+    let text = example("frpc.example.toml");
+    let cfg: ClientConfig = toml::from_str(&text).expect("frpc.example.toml 解析失败");
+    cfg.validate().expect("frpc.example.toml 校验失败");
     assert_eq!(cfg.server_port, 7000);
     let proxy = &cfg.proxies[0];
     assert_eq!(proxy.name, "test-tcp");
@@ -77,7 +77,7 @@ fn commented_keys(text: &str) -> Vec<String> {
 
 #[test]
 fn frps_example_commented_keys_exist() {
-    let text = example("frps.toml.example");
+    let text = example("frps.example.toml");
     // 已知字段名（含 frp 中我们尚未实现的，注释里提到了也算，见下面的白名单）
     let known: HashSet<&str> = [
         "bindAddr",
@@ -100,14 +100,14 @@ fn frps_example_commented_keys_exist() {
     for key in commented_keys(&text) {
         assert!(
             known.contains(key.as_str()),
-            "frps.toml.example 里注释掉的配置项 `{key}` 不是已知字段（拼错了？）"
+            "frps.example.toml 里注释掉的配置项 `{key}` 不是已知字段（拼错了？）"
         );
     }
 }
 
 #[test]
 fn frpc_example_commented_keys_exist() {
-    let text = example("frpc.toml.example");
+    let text = example("frpc.example.toml");
     let known: HashSet<&str> = [
         "serverAddr",
         "serverPort",
@@ -134,7 +134,7 @@ fn frpc_example_commented_keys_exist() {
     for key in commented_keys(&text) {
         assert!(
             known.contains(key.as_str()),
-            "frpc.toml.example 里注释掉的配置项 `{key}` 不是已知字段（拼错了？）"
+            "frpc.example.toml 里注释掉的配置项 `{key}` 不是已知字段（拼错了？）"
         );
     }
 }
@@ -146,7 +146,7 @@ fn frpc_example_commented_keys_exist() {
 /// 这个字段就跑到顶层，直接报 unknown field。
 #[test]
 fn commented_sections_are_self_consistent() {
-    for name in ["frps.toml.example", "frpc.toml.example"] {
+    for name in ["frps.example.toml", "frpc.example.toml"] {
         let text = example(name);
         let mut inside_commented_section = false;
 

@@ -7,13 +7,14 @@
 #
 # 示例:
 #   scripts/package.sh frps x86_64-unknown-linux-musl dist
-#   -> dist/frps_x86_64-linux-musl.tar.gz，包内就是 frps 与 frps.toml 两个文件
+#   -> dist/frps_x86_64-linux-musl.tar.gz，包内就是 frps 与 frps.example.toml 两个文件
 #
 # 几条约定：
 #   - 包名不带版本号：每个版本有各自的 release 与下载链接，文件名里再写一遍
 #     版本号只是重复；也不带 target 里的 `unknown`（rustc 对无厂商目标的占位段）
-#   - 包内只有二进制与配套配置，且不套一层目录，解压出来直接就是文件
-#   - 配置文件与二进制同名（frps 配 frps.toml），放在一起即可直接运行
+#   - 包内只有二进制与配置示例，且不套一层目录，解压出来直接就是文件
+#   - 配置示例在包内保持 .example 后缀：用户很可能就在解压目录里放着
+#     自己的 frps.toml，若包内也叫这个名字，解压会直接把配置覆盖掉
 #
 # 这个脚本同时被 .github/workflows/release.yml 和 ci.yml 使用：
 # release 用它产出真正的发布包，CI 用它做冒烟测试（每次 push 都验证一遍
@@ -55,10 +56,13 @@ stage="$(mktemp -d)"
 trap 'rm -rf "$stage"' EXIT
 
 install -m755 "$binary" "$stage/$comp"
-install -m644 "${comp}.toml.example" "$stage/$comp.toml"
+# 配置示例在包内保持 .example 后缀，不能改名成 ${comp}.toml：
+# 用户多半就在解压目录里放着自己的配置，直接解压会把配置覆盖掉。
+# 顺带一提，这也解释了为什么包内文件名必须带上 example。
+install -m644 "${comp}.example.toml" "$stage/$comp.example.toml"
 
 # 先切到 stage，再把**文件名**逐个列给 tar。
 # 不能写成 `tar czf x.tar.gz .`：那样包内路径会带上 `./` 前缀。
-(cd "$stage" && tar czf "$outdir_abs/$name.tar.gz" "$comp" "$comp.toml")
+(cd "$stage" && tar czf "$outdir_abs/$name.tar.gz" "$comp" "$comp.example.toml")
 
 echo "$outdir_abs/$name.tar.gz"

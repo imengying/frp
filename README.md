@@ -70,18 +70,21 @@ CHANGELOG.md   更新日志（release 说明取自这里）
 | ARM64 | `..._aarch64-linux-{gnu,musl}.tar.gz` |
 | ARMv7 | `..._armv7-linux-musleabihf.tar.gz` |
 
-包名不带版本号（版本看 release 标签即可），解压出来直接就是二进制与配套配置，
+包名不带版本号（版本看 release 标签即可），解压出来直接就是二进制与配置示例，
 没有多余目录：
 
 ```bash
 tar tzf frps_x86_64-linux-musl.tar.gz
 # frps
-# frps.toml
+# frps.example.toml
 
 tar xzf frps_x86_64-linux-musl.tar.gz
 ls
-# frps  frps.toml
+# frps  frps.example.toml
 ```
+
+包内的配置叫 `frps.example.toml`（带 `.example`），**故意不叫 `frps.toml`**：
+这样在已有配置的目录里解压，不会把你的 `frps.toml` 覆盖掉。
 
 装上并跑起来（以 x86_64 静态版为例）：
 
@@ -90,19 +93,22 @@ ls
 tar xzf frps_x86_64-linux-musl.tar.gz
 sudo install -m755 frps /usr/local/bin/
 sudo install -d /etc/frp
-sudo install -m644 frps.toml /etc/frp/frps.toml
+sudo install -m644 frps.example.toml /etc/frp/frps.toml
 $EDITOR /etc/frp/frps.toml           # 至少改 token
 frps -c /etc/frp/frps.toml --check   # 部署前校验配置
 
 # 客户端（另一台机器上同理）
 tar xzf frpc_x86_64-linux-musl.tar.gz
 sudo install -m755 frpc /usr/local/bin/
-sudo install -m644 frpc.toml /etc/frp/frpc.toml
+sudo install -m644 frpc.example.toml /etc/frp/frpc.toml
 $EDITOR /etc/frp/frpc.toml           # 改 token、serverAddr
 ```
 
-包内的配置文件名与二进制同名（`frps` 配 `frps.toml`），所以直接在解压目录里
-`./frps` 就能用默认配置名启动，不必先安装。
+升级时只取二进制即可，不会碰到配置：
+
+```bash
+sudo tar xzf frps_x86_64-linux-musl.tar.gz -C /usr/local/bin/ frps
+```
 
 两端 `token` 必须一致。静态（musl）版不依赖系统 libc，
 拷到任何 Linux 上都能直接跑，也适合 Alpine。
@@ -250,11 +256,11 @@ tail -f /var/log/frps.log
 
 ```bash
 # 服务端（公网机器）
-cp frps.toml.example frps.toml && vim frps.toml
+cp frps.example.toml frps.toml && vim frps.toml
 ./target/release/frps -c frps.toml
 
 # 客户端（内网机器）
-cp frpc.toml.example frpc.toml && vim frpc.toml
+cp frpc.example.toml frpc.toml && vim frpc.toml
 ./target/release/frpc -c frpc.toml
 ```
 
@@ -263,8 +269,8 @@ cp frpc.toml.example frpc.toml && vim frpc.toml
 ## 配置
 
 字段名与**官方 frp 一致**（`bindPort` / `serverAddr` / `localIP` / `remotePort` …），
-从 frp 迁移过来的配置基本可以直接用。完整选项见 `frps.toml.example` /
-`frpc.toml.example`，未配置的项一律走默认值。
+从 frp 迁移过来的配置基本可以直接用。完整选项见 `frps.example.toml` /
+`frpc.example.toml`，未配置的项一律走默认值。
 
 ### 服务端 `frps.toml`
 
