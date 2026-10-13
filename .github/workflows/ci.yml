@@ -118,8 +118,8 @@ jobs:
         run: |
           set -euo pipefail
           chmod +x scripts/package.sh
-          ./scripts/package.sh frps v0.0.0-ci ${{ matrix.target }} dist
-          ./scripts/package.sh frpc v0.0.0-ci ${{ matrix.target }} dist
+          ./scripts/package.sh frps ${{ matrix.target }} dist
+          ./scripts/package.sh frpc ${{ matrix.target }} dist
 
       - name: 校验包内容
         run: |
@@ -127,12 +127,15 @@ jobs:
           echo "== dist 内容 =="
           ls -la dist
 
-          # 除了两个压缩包之外不能有别的文件（解包目录残留会让发布步骤失败）
+          # 除了两个压缩包之外不能有别的文件（临时目录没清干净会让上传步骤出错）
           count=$(find dist -mindepth 1 -maxdepth 1 -type f | wc -l)
           [ "$count" -eq 2 ] || { echo "dist 下应为 2 个压缩包，实际 $count"; exit 1; }
 
-          frps_pkg="dist/frps_v0.0.0-ci_${{ matrix.target }}.tar.gz"
-          frpc_pkg="dist/frpc_v0.0.0-ci_${{ matrix.target }}.tar.gz"
+          # 包名不带版本号，也不带 target 里的 unknown
+          short_target="${{ matrix.target }}"
+          short_target="${short_target//-unknown-/-}"
+          frps_pkg="dist/frps_${short_target}.tar.gz"
+          frpc_pkg="dist/frpc_${short_target}.tar.gz"
           [ -f "$frps_pkg" ] || { echo "缺少 $frps_pkg"; exit 1; }
           [ -f "$frpc_pkg" ] || { echo "缺少 $frpc_pkg"; exit 1; }
 
@@ -148,15 +151,28 @@ jobs:
             listing=$(tar tzf "$pkg")
             echo "$listing"
 
-            echo "$listing" | grep -q "/${comp}$" || { echo "缺少 $comp 二进制"; exit 1; }
-            echo "$listing" | grep -q "/${comp}.toml.example" || { echo "缺少配置示例"; exit 1; }
-            echo "$listing" | grep -q "/README.md" || { echo "缺少 README"; exit 1; }
-
-            # 不能混进另一个组件的二进制
-            other=frps; [ "$comp" = frps ] && other=frpc
-            if echo "$listing" | grep -q "/${other}$"; then
-              echo "$pkg 里混进了 $other"; exit 1
+            # 包里只有二进制与配套配置，且必须是平铺的（不能套一层目录），
+            # 否则用户解压后还得再 cd 进去，也可能把上级目录搞乱。
+            # 不能用 $'...' 拼字符串：那是 ANSI-C quoting，变量不会展开，
+            # 比较会永远失败。
+            local expected
+            expected=$(printf '%s\n%s.toml' "$comp" "$comp")
+            if [ "$listing" != "$expected" ]; then
+              echo "$pkg 内容不合预期，应恰好是 ${comp} 与 ${comp}.toml 两个平铺文件"
+              echo "实际："; printf '%s\n' "$listing"
+              exit 1
             fi
+
+            # 解压出来的二进制要能跑、配置要能用：
+            # 二进制与同目录的 ${comp}.toml 直接配上就能启动
+            local work
+            work=$(mktemp -d)
+            tar xzf "$pkg" -C "$work"
+            [ -x "$work/${comp}" ] || { echo "解压后 ${comp} 没有可执行权限"; exit 1; }
+            "$work/${comp}" --version >/dev/null || { echo "${comp} 无法运行"; exit 1; }
+            "$work/${comp}" -c "$work/${comp}.toml" --check >/dev/null \
+              || { echo "包内 ${comp}.toml 无法通过配置校验"; exit 1; }
+            rm -rf "$work"
           }
           check "$frps_pkg" frps
           check "$frpc_pkg" frpc

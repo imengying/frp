@@ -3,13 +3,17 @@
 # 打包 frps / frpc 的分发压缩包。
 #
 # 用法:
-#   scripts/package.sh <组件> <版本> <target> [输出目录]
+#   scripts/package.sh <组件> <target> [输出目录]
 #
 # 示例:
-#   scripts/package.sh frps v1.0.0 x86_64-unknown-linux-musl dist
-#   -> dist/frps_v1.0.0_x86_64-unknown-linux-musl.tar.gz
+#   scripts/package.sh frps x86_64-unknown-linux-musl dist
+#   -> dist/frps_x86_64-linux-musl.tar.gz，包内就是 frps 与 frps.toml 两个文件
 #
-# Windows 目标产出 .zip，其他产出 .tar.gz。标准输出打印产物路径。
+# 几条约定：
+#   - 包名不带版本号：每个版本有各自的 release 与下载链接，文件名里再写一遍
+#     版本号只是重复；也不带 target 里的 `unknown`（rustc 对无厂商目标的占位段）
+#   - 包内只有二进制与配套配置，且不套一层目录，解压出来直接就是文件
+#   - 配置文件与二进制同名（frps 配 frps.toml），放在一起即可直接运行
 #
 # 这个脚本同时被 .github/workflows/release.yml 和 ci.yml 使用：
 # release 用它产出真正的发布包，CI 用它做冒烟测试（每次 push 都验证一遍
@@ -17,10 +21,9 @@
 
 set -euo pipefail
 
-comp="${1:?用法: package.sh <frps|frpc> <版本> <target> [输出目录]}"
-version="${2:?缺少版本号，例如 v1.0.0}"
-target="${3:?缺少 target，例如 x86_64-unknown-linux-musl}"
-outdir="${4:-dist}"
+comp="${1:?用法: package.sh <frps|frpc> <target> [输出目录]}"
+target="${2:?缺少 target，例如 x86_64-unknown-linux-musl}"
+outdir="${3:-dist}"
 
 case "$comp" in
 	frps | frpc) ;;
@@ -34,38 +37,28 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
 
 binary="target/$target/release/$comp"
-if [[ "$target" == *windows* ]]; then
-	binary="$binary.exe"
-fi
-
 if [[ ! -f "$binary" ]]; then
 	echo "找不到构建产物 $binary" >&2
 	echo "请先执行: cargo build --release --target $target" >&2
 	exit 1
 fi
 
-name="${comp}_${version}_${target}"
-stage="$outdir/$name"
+# x86_64-unknown-linux-musl -> x86_64-linux-musl
+short_target="${target//-unknown-/-}"
+name="${comp}_${short_target}"
 
-rm -rf "$stage"
-mkdir -p "$stage"
-cp "$binary" "$stage/"
-cp "${comp}.toml.example" README.md "$stage/"
+mkdir -p "$outdir"
+outdir_abs="$(cd "$outdir" && pwd)"
 
-if [[ "$target" == *windows* ]]; then
-	# Windows runner 自带 7z；Linux/macOS 上优先用 zip
-	if command -v 7z >/dev/null 2>&1; then
-		(cd "$outdir" && 7z a -bso0 -bsp0 "$name.zip" "$name" >/dev/null)
-	else
-		(cd "$outdir" && zip -qr "$name.zip" "$name")
-	fi
-	artifact="$outdir/$name.zip"
-else
-	(cd "$outdir" && tar czf "$name.tar.gz" "$name")
-	artifact="$outdir/$name.tar.gz"
-fi
+# 在临时目录里备料：解包目录留在输出去会让下游的上传/校验步骤数错文件。
+stage="$(mktemp -d)"
+trap 'rm -rf "$stage"' EXIT
 
-# 只保留压缩包，解包目录留在原地会让下游的上传/校验步骤出错
-rm -rf "$stage"
+install -m755 "$binary" "$stage/$comp"
+install -m644 "${comp}.toml.example" "$stage/$comp.toml"
 
-echo "$artifact"
+# 先切到 stage，再把**文件名**逐个列给 tar。
+# 不能写成 `tar czf x.tar.gz .`：那样包内路径会带上 `./` 前缀。
+(cd "$stage" && tar czf "$outdir_abs/$name.tar.gz" "$comp" "$comp.toml")
+
+echo "$outdir_abs/$name.tar.gz"

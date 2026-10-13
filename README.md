@@ -65,28 +65,44 @@ CHANGELOG.md   更新日志（release 说明取自这里）
 
 | 平台 | 服务端 / 客户端 |
 | --- | --- |
-| x86_64 | `frps_<版本>_x86_64-unknown-linux-gnu.tar.gz` / `frpc_<版本>_...` |
-| x86_64（静态，任意发行版、Alpine 通用） | `..._x86_64-unknown-linux-musl.tar.gz` |
-| ARM64 | `..._aarch64-unknown-linux-{gnu,musl}.tar.gz` |
-| ARMv7 | `..._armv7-unknown-linux-musleabihf.tar.gz` |
+| x86_64 | `frps_x86_64-linux-gnu.tar.gz` / `frpc_x86_64-linux-gnu.tar.gz` |
+| x86_64（静态，任意发行版、Alpine 通用） | `frps_x86_64-linux-musl.tar.gz` / `frpc_x86_64-linux-musl.tar.gz` |
+| ARM64 | `..._aarch64-linux-{gnu,musl}.tar.gz` |
+| ARMv7 | `..._armv7-linux-musleabihf.tar.gz` |
+
+包名不带版本号（版本看 release 标签即可），解压出来直接就是二进制与配套配置，
+没有多余目录：
 
 ```bash
-# 服务端（以 Linux x86_64 静态版为例）
-tar xzf frps_v1.0.0_x86_64-unknown-linux-musl.tar.gz
-cd frps_v1.0.0_x86_64-unknown-linux-musl
+tar tzf frps_x86_64-linux-musl.tar.gz
+# frps
+# frps.toml
+
+tar xzf frps_x86_64-linux-musl.tar.gz
+ls
+# frps  frps.toml
+```
+
+装上并跑起来（以 x86_64 静态版为例）：
+
+```bash
+# 服务端
+tar xzf frps_x86_64-linux-musl.tar.gz
 sudo install -m755 frps /usr/local/bin/
 sudo install -d /etc/frp
-sudo install -m644 frps.toml.example /etc/frp/frps.toml
+sudo install -m644 frps.toml /etc/frp/frps.toml
 $EDITOR /etc/frp/frps.toml           # 至少改 token
 frps -c /etc/frp/frps.toml --check   # 部署前校验配置
 
-# 客户端（在另一台机器上同理）
-tar xzf frpc_v1.0.0_x86_64-unknown-linux-musl.tar.gz
-cd frpc_v1.0.0_x86_64-unknown-linux-musl
+# 客户端（另一台机器上同理）
+tar xzf frpc_x86_64-linux-musl.tar.gz
 sudo install -m755 frpc /usr/local/bin/
-sudo install -m644 frpc.toml.example /etc/frp/frpc.toml
-$EDITOR /etc/frp/frpc.toml           # 改 token、server_addr
+sudo install -m644 frpc.toml /etc/frp/frpc.toml
+$EDITOR /etc/frp/frpc.toml           # 改 token、serverAddr
 ```
+
+包内的配置文件名与二进制同名（`frps` 配 `frps.toml`），所以直接在解压目录里
+`./frps` 就能用默认配置名启动，不必先安装。
 
 两端 `token` 必须一致。静态（musl）版不依赖系统 libc，
 拷到任何 Linux 上都能直接跑，也适合 Alpine。

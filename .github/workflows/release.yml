@@ -170,13 +170,11 @@ jobs:
       # 打包逻辑在 scripts/package.sh，与 CI 的冒烟测试共用同一份
       - name: 打包 frps 与 frpc
         shell: bash
-        env:
-          VERSION: ${{ needs.prepare.outputs.version }}
         run: |
           set -euo pipefail
           chmod +x scripts/package.sh
-          ./scripts/package.sh frps "$VERSION" "${{ matrix.target }}" dist
-          ./scripts/package.sh frpc "$VERSION" "${{ matrix.target }}" dist
+          ./scripts/package.sh frps "${{ matrix.target }}" dist
+          ./scripts/package.sh frpc "${{ matrix.target }}" dist
           echo "打包结果："
           ls -la dist
 
