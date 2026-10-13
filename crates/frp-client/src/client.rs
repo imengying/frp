@@ -87,6 +87,15 @@ impl Client {
         );
         let server = self.server_addr();
         let mut shutdown = self.shutdown_tx.subscribe();
+        // 是否成功连上过服务端。用来区分两种断开：
+        //   - 一次都没连上（配置写错、服务端没起）-> error，默认日志级别可见
+        //   - 连上过之后断开（服务端重启、网络抖动）-> warn，
+        //     这类断开很常见且通常能自行恢复，用 error 会刷屏
+        let mut ever_connected = false;
+        // 始终连不上时的连续失败次数。一直连不上又每次都报 error 会把
+        // journal 刷爆（重试间隔也可能退避到几十秒），所以只在第一次报，
+        // 之后沉寂，避免日志把磁盘写满。
+        let mut connect_failures: u64 = 0;
 
         loop {
             if *shutdown.borrow() {
@@ -94,8 +103,9 @@ impl Client {
                 return Ok(());
             }
 
+            // session 内部会在登录成功后把 ever_connected 置位
             let outcome = tokio::select! {
-                outcome = self.session(&mut backoff) => outcome,
+                outcome = self.session(&mut backoff, &mut ever_connected) => outcome,
                 _ = shutdown.changed() => {
                     info!("收到关闭请求，断开与 {server} 的连接后退出");
                     return Ok(());
@@ -105,7 +115,23 @@ impl Client {
             match outcome {
                 SessionEnd::Disconnected(err) => {
                     if let Some(err) = err {
-                        warn!("与 {server} 的连接中断: {err:#}");
+                        if ever_connected {
+                            warn!("与 {server} 的连接中断: {err:#}");
+                        } else {
+                            connect_failures += 1;
+                            match classify_connect_failure(connect_failures) {
+                                ConnectFailureLog::FirstError => error!(
+                                    "无法连接服务端 {server}: {err:#}（将持续重试，请检查 serverAddr/serverPort、\
+                                     网络连通性与服务端是否已启动）"
+                                ),
+                                ConnectFailureLog::PeriodicError => error!(
+                                    "仍无法连接服务端 {server}，已连续失败 {connect_failures} 次"
+                                ),
+                                ConnectFailureLog::Silent => {
+                                    debug!("第 {connect_failures} 次连接 {server} 失败: {err:#}");
+                                }
+                            }
+                        }
                     }
                 }
                 SessionEnd::Rejected(reason) => {
@@ -134,7 +160,7 @@ impl Client {
     }
 
     /// 建立一次会话并维持长连接，返回会话结束的原因。
-    async fn session(&self, backoff: &mut Backoff) -> SessionEnd {
+    async fn session(&self, backoff: &mut Backoff, ever_connected: &mut bool) -> SessionEnd {
         let server = self.server_addr();
         let stream = match connect_server(
             &server,
@@ -147,11 +173,16 @@ impl Client {
             Err(err) => return SessionEnd::Disconnected(Some(err)),
         };
         info!("已连接服务端 {server}，正在登录");
-        self.serve(stream, backoff).await
+        self.serve(stream, backoff, ever_connected).await
     }
 
     /// 在一条已建立的控制连接上完成登录并维持长连接。
-    async fn serve(&self, stream: ServerStream, backoff: &mut Backoff) -> SessionEnd {
+    async fn serve(
+        &self,
+        stream: ServerStream,
+        backoff: &mut Backoff,
+        ever_connected: &mut bool,
+    ) -> SessionEnd {
         let (mut rd, mut wr) = tokio::io::split(stream);
         let interval_secs = self.cfg.transport.heartbeat_interval;
 
@@ -198,6 +229,7 @@ impl Client {
             }
         };
 
+        *ever_connected = true;
         info!("登录成功 run_id={run_id}，控制长连接已建立");
         for err in &proxy_errors {
             error!("代理 `{}` 注册失败: {}", err.name, err.error);
@@ -427,6 +459,39 @@ async fn pool_maintain_loop(cfg: Arc<ClientConfig>, ctx: SessionCtx) {
     }
 
     tasks.shutdown().await;
+}
+
+/// 决定「连不上服务端」这件事该用哪个日志级别报。
+///
+/// 分成三种情况，是权衡「必须看得见」和「不能刷屏」的结果：
+///
+/// - 首次失败用 error：默认日志级别就是 error，这是服务端没起、
+///   端口写错、两端版本不匹配这类问题唯一的提示。少了它，
+///   `systemctl status` 只会显示 active (running)，运维看不出异常。
+/// - 之后的失败降为 debug：重试间隔可能只有一秒，每次都报会把
+///   journal 刷爆。但每隔 100 次补一条 error，让日志能反映进程
+///   仍在重试而不是卡死了。
+/// - 曾经连上过再断开（ever_connected）不归这里管，由调用方按 warn 处理：
+///   服务端重启、网络抖动都很常见，通常能自行恢复，不该按 error 处理。
+#[derive(Debug, PartialEq, Eq)]
+enum ConnectFailureLog {
+    /// 首次失败：默认日志级别可见
+    FirstError,
+    /// 第 N 次失败：默认不可见，仅 debug
+    Silent,
+    /// 连续失败满一轮：补一条 error，说明仍在重试
+    PeriodicError,
+}
+
+/// 见 [`ConnectFailureLog`] 的说明。
+fn classify_connect_failure(failures: u64) -> ConnectFailureLog {
+    if failures <= 1 {
+        ConnectFailureLog::FirstError
+    } else if failures % 100 == 0 {
+        ConnectFailureLog::PeriodicError
+    } else {
+        ConnectFailureLog::Silent
+    }
 }
 
 /// 会话结束的原因。
@@ -829,6 +894,38 @@ mod tests {
             }],
             ..ClientConfig::default()
         }
+    }
+
+    /// 连不上服务端时的日志级别选择：首次必须可见，之后不能刷屏，
+    /// 但也要留下「仍在重试」的痕迹。
+    #[test]
+    fn connect_failure_logging_is_visible_then_quiet() {
+        // 首次失败必须报 error——默认日志级别下这是唯一的线索
+        assert_eq!(
+            classify_connect_failure(1),
+            ConnectFailureLog::FirstError,
+            "首次连接失败必须让默认级别看得见"
+        );
+
+        // 后续失败沉寂，避免一秒一条把 journal 刷爆
+        for n in 2..100 {
+            assert_eq!(
+                classify_connect_failure(n),
+                ConnectFailureLog::Silent,
+                "第 {n} 次失败不该再报 error"
+            );
+        }
+
+        // 但每隔一轮要提醒一次，说明进程仍在重试
+        assert_eq!(
+            classify_connect_failure(100),
+            ConnectFailureLog::PeriodicError
+        );
+        assert_eq!(
+            classify_connect_failure(200),
+            ConnectFailureLog::PeriodicError
+        );
+        assert_eq!(classify_connect_failure(101), ConnectFailureLog::Silent);
     }
 
     #[test]
