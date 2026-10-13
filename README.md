@@ -472,7 +472,11 @@ cargo fmt --all -- --check
 
 ## 已知限制
 
-- 不支持 UDP、HTTP 多路复用、TLS、压缩、P2P
+- 不支持 UDP、HTTP 多路复用、压缩、P2P、STCP/XTCP
 - 不做限速、流量统计、访问控制（只能靠 `allowPorts` 限定端口范围）
 - 客户端连接本地服务失败时，该次访问直接断开（不重试）
 - 健康检查只支持 TCP 连通性探测（无 HTTP 探针）
+- **不支持配置热重载**：`SIGHUP` 未被捕获，进程会直接终止
+  （改完配置用 `systemctl restart`，不要用 `reload`）
+- 加密不等于认证：TLS 默认只保证链路加密，要用 `trustedCaFile`
+  才会校验服务端身份
