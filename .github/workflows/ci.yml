@@ -114,6 +114,13 @@ jobs:
         if: matrix.native == false
         run: cross build --release --locked --target ${{ matrix.target }}
 
+      # 交叉目标的产物在本机跑不起来（架构不同），但配置校验需要能执行的
+      # 二进制。用本机目标再构建一份，专门用来校验包内配置——配置是文本，
+      # 与二进制架构无关。
+      - name: 构建本机二进制（供交叉目标校验配置用）
+        if: matrix.native == false
+        run: cargo build --release --locked --target x86_64-unknown-linux-gnu
+
       - name: 打包两个组件
         run: |
           set -euo pipefail
@@ -122,6 +129,9 @@ jobs:
           ./scripts/package.sh frpc ${{ matrix.target }} dist
 
       - name: 校验包内容
+        env:
+          # 交叉架构的包在本机跑不起来，用它来校验包内配置
+          NATIVE_BIN: target/x86_64-unknown-linux-gnu/release
         run: |
           set -euo pipefail
           echo "== dist 内容 =="
@@ -134,56 +144,13 @@ jobs:
           # 包名不带版本号，也不带 target 里的 unknown
           short_target="${{ matrix.target }}"
           short_target="${short_target//-unknown-/-}"
-          frps_pkg="dist/frps_${short_target}.tar.gz"
-          frpc_pkg="dist/frpc_${short_target}.tar.gz"
-          [ -f "$frps_pkg" ] || { echo "缺少 $frps_pkg"; exit 1; }
-          [ -f "$frpc_pkg" ] || { echo "缺少 $frpc_pkg"; exit 1; }
 
-          check() {
-            local pkg="$1" comp="$2"
-            echo "== $pkg =="
-
-            # 先把清单读进变量再用 grep 判断。
-            # 不能写成 `tar tzf ... | grep -q`：grep -q 命中后立刻退出，
-            # tar 收到 SIGPIPE 返回非 0，在 pipefail 下整条管道算失败，
-            # 判断就永远不成立，校验会静默失效。
-            local listing other
-            listing=$(tar tzf "$pkg")
-            echo "$listing"
-
-            # 包里只有二进制与配套配置，且必须是平铺的（不能套一层目录），
-            # 否则用户解压后还得再 cd 进去，也可能把上级目录搞乱。
-            # 不能用 $'...' 拼字符串：那是 ANSI-C quoting，变量不会展开，
-            # 比较会永远失败。
-            local expected
-            expected=$(printf '%s\n%s.toml' "$comp" "$comp")
-            if [ "$listing" != "$expected" ]; then
-              echo "$pkg 内容不合预期，应恰好是 ${comp} 与 ${comp}.toml 两个平铺文件"
-              echo "实际："; printf '%s\n' "$listing"
-              exit 1
-            fi
-
-            # 解压出来的二进制要能跑、配置要能用：
-            # 二进制与同目录的 ${comp}.toml 直接配上就能启动
-            local work
-            work=$(mktemp -d)
-            tar xzf "$pkg" -C "$work"
-            [ -x "$work/${comp}" ] || { echo "解压后 ${comp} 没有可执行权限"; exit 1; }
-            "$work/${comp}" --version >/dev/null || { echo "${comp} 无法运行"; exit 1; }
-            "$work/${comp}" -c "$work/${comp}.toml" --check >/dev/null \
-              || { echo "包内 ${comp}.toml 无法通过配置校验"; exit 1; }
-            rm -rf "$work"
-          }
-          check "$frps_pkg" frps
-          check "$frpc_pkg" frpc
-
-          # musl 目标应当是静态链接——这是它相对 gnu 包的全部意义
-          if [[ "${{ matrix.target }}" == *musl* ]]; then
-            echo "== 静态链接检查 =="
-            file "target/${{ matrix.target }}/release/frps"
-            if ! file "target/${{ matrix.target }}/release/frps" | grep -q "statically linked\|static-pie"; then
-              echo "musl 目标应当静态链接，实际不是"; exit 1
-            fi
+          chmod +x scripts/verify-package.sh
+          if [ "${{ matrix.native }}" = "true" ]; then
+            ./scripts/verify-package.sh "dist/frps_${short_target}.tar.gz" frps
+            ./scripts/verify-package.sh "dist/frpc_${short_target}.tar.gz" frpc
+          else
+            ./scripts/verify-package.sh "dist/frps_${short_target}.tar.gz" frps "$NATIVE_BIN"
+            ./scripts/verify-package.sh "dist/frpc_${short_target}.tar.gz" frpc "$NATIVE_BIN"
           fi
 
-          echo "打包冒烟测试通过（${{ matrix.target }}）"
