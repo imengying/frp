@@ -48,6 +48,11 @@ enable = false
 
 ### 变更
 
+- **发布包精简**：包名去掉版本号与 target 里的 `unknown`
+  （`frps_v1.0.3_x86_64-unknown-linux-musl.tar.gz` → `frps_x86_64-linux-musl.tar.gz`）；
+  包内不再套一层目录、不再附带 README，只剩二进制与配套配置，
+  解压出来直接就是 `frps` 与 `frps.toml`。配置文件名与二进制同名，
+  因此在解压目录里直接 `./frps` 就能用默认配置名启动
 - **默认日志级别改为 `error`**：正常运行时不再刷屏。
   启动确认与 `--check` 的结果改为直接输出，不受日志级别影响。
   需要看连接、重连、代理注册等过程信息时设 `[log] level = "info"`，
