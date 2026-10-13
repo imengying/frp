@@ -268,6 +268,15 @@ impl Shared {
     /// - `0x17`（我们的标记）或 `0x16`（标准 TLS ClientHello）→ 走 TLS
     /// - 其他 → 明文连接，把读掉的那个字节续回流的开头
     async fn accept_tls(&self, stream: TcpStream) -> Result<Conn> {
+        self.accept_tls_within(stream, FIRST_MSG_TIMEOUT).await
+    }
+
+    /// [`Shared::accept_tls`] 的本体，超时可注入，便于测试。
+    async fn accept_tls_within(
+        &self,
+        stream: TcpStream,
+        first_byte_timeout: Duration,
+    ) -> Result<Conn> {
         let Some(tls) = self.tls.as_ref() else {
             // 未启用 TLS：不做任何探测，避免白白多读一个字节
             return Ok(Box::new(stream));
@@ -276,11 +285,23 @@ impl Shared {
         use tokio::io::AsyncReadExt;
         let mut stream = stream;
         let mut first = [0u8; 1];
-        // 读不到（对端秒断）就直接结束，交给上层记录
-        let n = stream
-            .read(&mut first)
-            .await
-            .context("读取连接首字节失败")?;
+        // 这个读必须有超时：TLS 默认开启，所以每条新连接都会走到这里。
+        // 没有超时的话，连上却不发数据的连接会永久占着一个任务与一个
+        // socket（handle_conn 里的 FIRST_MSG_TIMEOUT 根本轮不到执行）。
+        // 扫描器或误配置的探活很容易制造这种连接。
+        //
+        // 超时后必须**显式关闭**连接：`timeout` 只是取消那个 future，
+        // 而这里读的是借用的 `&mut stream`，取消并不会 drop 流本身，
+        // 连接会一直处于 ESTAB。所以超时分支里主动 shutdown。
+        let n = match timeout(first_byte_timeout, stream.read(&mut first)).await {
+            Ok(res) => res.context("读取连接首字节失败")?,
+            Err(_) => {
+                // 取消 future 并不会关闭这条连接（读的是借用的流），
+                // 所以要显式 shutdown，否则对端不发数据时它会一直占着。
+                let _ = stream.shutdown().await;
+                bail!("等待连接首字节超时（{first_byte_timeout:?}），已关闭连接");
+            }
+        };
         if n == 0 {
             bail!("连接在发送任何数据前就关闭了");
         }
@@ -1007,4 +1028,67 @@ async fn send_login_resp(
         max_pool_count,
     };
     write_msg(wr, &resp).await.context("发送登录响应失败")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 构造一个只启用了（或没启用）TLS 的 Shared。
+    fn shared_with(tls_enable: bool) -> Arc<Shared> {
+        let mut cfg = ServerConfig {
+            bind_addr: "127.0.0.1".into(),
+            bind_port: 0,
+            token: "t".into(),
+            ..Default::default()
+        };
+        cfg.transport.tls.enable = tls_enable;
+        let server = Server::new(cfg).expect("构造 Server 失败");
+        server.shared.clone()
+    }
+
+    /// TLS 模式下，只连不发的连接必须被超时关掉。
+    ///
+    /// 这条路径在 TLS 默认开启时覆盖**每一条**新连接：服务端要先读一个
+    /// 字节判断是不是 TLS。少了超时，对端连上却不发数据就会一直占着
+    /// 一个任务和一个 socket——`handle_conn` 里的 FIRST_MSG_TIMEOUT
+    /// 根本轮不到执行。扫描器或误配的探活很容易攒出一堆这种连接。
+    #[tokio::test]
+    async fn tls_mode_closes_silent_connection_after_timeout() {
+        let shared = shared_with(true);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // 客户端只连接，一个字节都不发
+        let _client = TcpStream::connect(addr).await.unwrap();
+        let (stream, _peer) = listener.accept().await.unwrap();
+
+        // 注入一个极短的超时，免得测试真等 10 秒
+        let result = shared
+            .accept_tls_within(stream, Duration::from_millis(100))
+            .await;
+        assert!(
+            result.is_err(),
+            "只连不发的连接应当被超时拒绝，而不是无限期占着"
+        );
+    }
+
+    /// 关掉 TLS 时不做首字节探测：明文本就不需要判断，连接立即可用。
+    ///
+    /// 反过来说，这条也保证了明文模式不会因为探测而卡住。
+    #[tokio::test]
+    async fn plain_mode_does_not_wait_for_first_byte() {
+        let shared = shared_with(false);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let _client = TcpStream::connect(addr).await.unwrap();
+        let (stream, _peer) = listener.accept().await.unwrap();
+
+        // 若走了「读首字节」这条路，100ms 后会超时返回 Err
+        let result = shared
+            .accept_tls_within(stream, Duration::from_millis(100))
+            .await;
+        assert!(result.is_ok(), "明文模式不该等待首字节");
+    }
 }
