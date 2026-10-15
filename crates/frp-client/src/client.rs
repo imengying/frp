@@ -31,6 +31,7 @@ use frp_core::util::random_fraction;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::{Notify, mpsc, oneshot};
+use tokio::task::JoinSet;
 use tokio::time::{MissedTickBehavior, interval, sleep, timeout};
 use tracing::{debug, error, info, warn};
 
@@ -289,8 +290,23 @@ impl Client {
         alive: Arc<Notify>,
         mut dead_rx: oneshot::Receiver<anyhow::Error>,
     ) -> SessionEnd {
-        loop {
+        // 按需建立的工作连接任务。
+        //
+        // 必须托管起来：它们持有到服务端与本地服务两条 socket，如果只是
+        // `tokio::spawn` 而不留句柄，本会话结束时没人 abort 它们——服务端
+        // 异常消失（进程被杀、容器重启）后，任务里的 `bridge` 会等一个
+        // 永远不会来的 FIN，socket 就永久停在 CLOSE-WAIT / FIN-WAIT-2。
+        //
+        // 用 JoinSet 而非 Vec：连接结束时任务会被自动回收，不会随会话
+        // 时长无界增长。
+        let mut work_conns: JoinSet<()> = JoinSet::new();
+
+        // 循环体放在内层，函数退出前统一 abort 工作连接任务。
+        // 直接在内层 return 会跳过清理，所以这里用 break 带出结果。
+        let outcome = loop {
             tokio::select! {
+                // 回收已结束的工作连接任务，避免句柄堆积
+                Some(_) = work_conns.join_next(), if !work_conns.is_empty() => {}
                 msg = read_msg(rd) => match msg {
                     // 服务端有公网访问进来，按需建立工作连接
                     Ok(Some(Message::ReqWorkConn { nonce, proxy_name })) => {
@@ -303,7 +319,7 @@ impl Client {
                         let server = ctx.server.clone();
                         let run_id = ctx.run_id.clone();
                         let tls = ctx.tls.clone();
-                        tokio::spawn(async move {
+                        work_conns.spawn(async move {
                             if let Err(err) = on_demand_work_conn(
                                 &server,
                                 &run_id,
@@ -340,16 +356,20 @@ impl Client {
                     }
                     Ok(None) => {
                         info!("服务端关闭了控制连接");
-                        return SessionEnd::Disconnected(None);
+                        break SessionEnd::Disconnected(None);
                     }
-                    Err(err) => return SessionEnd::Disconnected(Some(err)),
+                    Err(err) => break SessionEnd::Disconnected(Some(err)),
                 },
                 reason = &mut dead_rx => {
                     let err = reason.unwrap_or_else(|_| anyhow!("心跳任务已结束"));
-                    return SessionEnd::Disconnected(Some(err));
+                    break SessionEnd::Disconnected(Some(err));
                 }
             }
-        }
+        };
+
+        // 会话结束：停掉所有按需建立的工作连接任务，释放它们持有的 socket。
+        work_conns.shutdown().await;
+        outcome
     }
 }
 

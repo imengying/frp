@@ -177,6 +177,16 @@ impl Server {
         loop {
             tokio::select! {
                 _ = shutdown.changed() => break,
+                // 回收已结束的连接任务。
+                //
+                // JoinSet 不会自动丢弃已完成的任务：只 spawn 不 join 的话，
+                // 每个结束的连接都会在集合里留下一份记录，内存只增不减
+                // （每条记录含任务的返回值与元数据）。这里持续取走它们。
+                //
+                // 用 try_join_next 做非阻塞回收，再在循环开头反复取，
+                // 一次只回收一个也不怕——下一轮 select 会立刻再次命中，
+                // 为空时返回 None 而不会空转（branches 会挂起）。
+                Some(_) = conns.join_next(), if !conns.is_empty() => {}
                 accepted = listener.accept() => match accepted {
                     Ok((stream, peer)) => {
                         tune_stream(&stream, shared.cfg.transport.tcp_keepalive);
@@ -1071,6 +1081,34 @@ mod tests {
             result.is_err(),
             "只连不发的连接应当被超时拒绝，而不是无限期占着"
         );
+    }
+
+    /// 连接任务结束后必须被回收，不能留在 JoinSet 里。
+    ///
+    /// JoinSet 不会自动丢弃已完成的任务，只 spawn 不 join 的话每个结束的
+    /// 连接都会留下一条记录，内存随连接数单调增长。线上表现是：frps 跑久
+    /// 了 RSS 一路涨（重启就回落），但这不会体现在连接数或 fd 上。
+    #[tokio::test]
+    async fn finished_connection_tasks_are_reaped() {
+        let mut conns: JoinSet<()> = JoinSet::new();
+
+        for _ in 0..64 {
+            conns.spawn(async {});
+        }
+        // 让任务跑完
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(conns.len(), 64, "任务应仍在集合中，等待被取走");
+
+        // 主循环里做的回收
+        let mut reaped = 0;
+        while conns.try_join_next().is_some() {
+            reaped += 1;
+        }
+        assert_eq!(reaped, 64, "所有已完成任务都应被取走");
+        assert!(conns.is_empty(), "回收后集合应为空");
+
+        // 空集合上调用不该 panic 或空转
+        assert!(conns.try_join_next().is_none());
     }
 
     /// 关掉 TLS 时不做首字节探测：明文本就不需要判断，连接立即可用。

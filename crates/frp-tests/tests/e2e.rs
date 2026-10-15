@@ -1143,3 +1143,76 @@ async fn wrong_ca_is_rejected() {
     // 这里只要求「不 panic / 能正常退出」；
     // 真正的拒绝行为由 tls 模块的 trusted_ca 单元测试覆盖
 }
+
+/// 服务端消失后，客户端应当关闭所有工作连接，不留残连。
+///
+/// 场景：访客连着，服务端进程被杀（容器重启、OOM、进程崩溃都会这样）。
+/// 客户端那条按需建立的工作连接任务如果没人管，会等一个永远不来的 FIN，
+/// socket 永久停在 CLOSE-WAIT / FIN-WAIT-2——每条泄漏两个 fd，
+/// 重启次数多了就攒出一堆。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn client_releases_work_conns_when_server_disappears() {
+    // 本地服务：接受连接后一直挂着，不主动关闭
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let local = listener.local_addr().unwrap();
+    let accepted = Arc::new(AtomicBool::new(false));
+    let acc = accepted.clone();
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            acc.store(true, Ordering::SeqCst);
+            // 持有连接，不读不写也不关
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(120)).await;
+                drop(stream);
+            });
+        }
+    });
+
+    let remote_port = reserve_port();
+    let (server, server_task) = start_server(AllowPorts::default()).await;
+    let cfg = ClientSpec {
+        server,
+        proxy_name: "leak",
+        remote_port,
+        local_host: &local.ip().to_string(),
+        local_port: local.port(),
+    }
+    .into_config();
+    let _client = start_client(cfg);
+    wait_remote_ready(remote_port).await;
+
+    // 开一条访客连接并保持住，让客户端建立一条工作连接
+    let visitor = TcpStream::connect(("127.0.0.1", remote_port))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        accepted.load(Ordering::SeqCst),
+        "本地服务应已收到客户端的连接"
+    );
+
+    // 服务端突然消失
+    server_task.abort();
+    let _ = server_task.await;
+
+    // 客户端应尽快关闭那条工作连接：本地服务侧会读到 EOF
+    let mut visitor = visitor;
+    let closed = tokio::time::timeout(Duration::from_secs(10), async {
+        let mut buf = [0u8; 64];
+        loop {
+            match visitor.read(&mut buf).await {
+                Ok(0) => return true, // 收到 EOF，连接确实被关了
+                Ok(_) => continue,
+                Err(_) => return true, // 被重置也算关闭
+            }
+        }
+    })
+    .await;
+    assert!(
+        closed.is_ok(),
+        "服务端消失后，客户端应关闭工作连接；10 秒内没关说明 socket 泄漏了"
+    );
+}
